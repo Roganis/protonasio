@@ -1,0 +1,11 @@
+# Build outputs
+share/proton-asio/
+build/.work/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+*.swp
+.DS_Store

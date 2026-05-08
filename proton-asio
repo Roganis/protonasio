@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+# proton-asio — companion tool that adds ASIO support to any Proton prefix.
+#
+# Insert into a game's Steam launch options as:
+#     PROTON_ASIO=1 proton-asio %command%
+#
+# When PROTON_ASIO=1, locates the prefix and the Proton-bundled Wine,
+# installs the configured ASIO bridge into the prefix idempotently, and
+# execs the original command. When PROTON_ASIO is unset or != "1", does
+# nothing — execs the original command verbatim.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 proton-asio contributors
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Iterable
+
+TOOL_VERSION = "0.1.0"
+LOG_PREFIX = "[proton-asio]"
+MARKER_NAME = ".proton_asio_installed"
+MARKER_SCHEMA = "v1"
+
+PROTON_VERBS = {
+    "run", "runinprefix", "waitforexitandrun",
+    "getcompatpath", "getnativepath",
+}
+
+KNOWN_BRIDGES = ("wineasio", "pwasio")
+DEFAULT_BRIDGE = "wineasio"
+
+DEBUG = os.environ.get("PROTON_ASIO_DEBUG") == "1"
+
+
+def log(msg: str) -> None:
+    print(f"{LOG_PREFIX} {msg}", file=sys.stderr, flush=True)
+
+
+def dbg(msg: str) -> None:
+    if DEBUG:
+        log(f"debug: {msg}")
+
+
+def warn(msg: str) -> None:
+    log(f"warn: {msg}")
+
+
+def err(msg: str) -> None:
+    log(f"error: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+def _proton_dir_looks_real(p: Path) -> bool:
+    if not (p / "proton").is_file():
+        return False
+    return (
+        (p / "files/bin/wine64").exists()
+        or (p / "dist/bin/wine64").exists()
+    )
+
+
+def find_proton_dir(argv: list[str]) -> Path | None:
+    """Locate the active Proton install dir.
+
+    Primary: STEAM_COMPAT_TOOL_PATHS (colon-delimited list of compat-tool
+    paths bind-mounted by Steam's runtime). Fallback: argv scan for a
+    `proton` script followed by a known verb.
+    """
+    paths_env = os.environ.get("STEAM_COMPAT_TOOL_PATHS", "")
+    for entry in paths_env.split(":"):
+        if not entry:
+            continue
+        p = Path(entry)
+        if _proton_dir_looks_real(p):
+            dbg(f"proton dir via STEAM_COMPAT_TOOL_PATHS: {p}")
+            return p
+
+    for i in range(len(argv) - 1):
+        a = argv[i]
+        if Path(a).name == "proton" and argv[i + 1] in PROTON_VERBS:
+            d = Path(a).resolve().parent
+            if _proton_dir_looks_real(d):
+                dbg(f"proton dir via argv scan: {d}")
+                return d
+
+    return None
+
+
+def find_wine_binaries(proton_dir: Path) -> tuple[Path | None, Path | None]:
+    for sub in ("files/bin", "dist/bin"):
+        w64 = proton_dir / sub / "wine64"
+        if w64.exists():
+            w32 = proton_dir / sub / "wine"
+            return w64, (w32 if w32.exists() else None)
+    return None, None
+
+
+def share_dir_candidates() -> list[Path]:
+    out: list[Path] = []
+    if (override := os.environ.get("PROTON_ASIO_SHARE_DIR")):
+        out.append(Path(override))
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    out.append(Path(xdg) / "proton-asio")
+    out.append(Path("/usr/local/share/proton-asio"))
+    out.append(Path("/usr/share/proton-asio"))
+    # In-tree run (development).
+    script_dir = Path(__file__).resolve().parent
+    out.append(script_dir / "share/proton-asio")
+    return out
+
+
+def find_bridge_dir(bridge: str) -> Path | None:
+    for d in share_dir_candidates():
+        bdir = d / bridge
+        if (bdir / "manifest.txt").is_file():
+            dbg(f"bridge dir: {bdir}")
+            return bdir
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Manifest + marker
+# ---------------------------------------------------------------------------
+
+def read_manifest(bdir: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in (bdir / "manifest.txt").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def manifest_dll_paths(bdir: Path, m: dict[str, str]) -> list[Path]:
+    paths: list[Path] = []
+    for key in ("dll64", "dll32"):
+        if key in m:
+            paths.append(bdir / m[key])
+    return paths
+
+
+def sha256_of_files(paths: Iterable[Path]) -> str:
+    h = hashlib.sha256()
+    for p in paths:
+        h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def expected_marker(bridge: str, m: dict[str, str], dll_paths: list[Path]) -> str:
+    bv = m.get("version", "unknown")
+    return f"{MARKER_SCHEMA}|{bridge}|{bv}|{TOOL_VERSION}|{sha256_of_files(dll_paths)}"
+
+
+def read_marker(pfx: Path) -> str | None:
+    p = pfx / MARKER_NAME
+    if not p.is_file():
+        return None
+    try:
+        return p.read_text().strip()
+    except OSError as e:
+        warn(f"could not read marker {p}: {e}")
+        return None
+
+
+def write_marker(pfx: Path, content: str) -> None:
+    p = pfx / MARKER_NAME
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(p)
+
+
+# ---------------------------------------------------------------------------
+# .reg rendering
+# ---------------------------------------------------------------------------
+
+def hex_dword(n: int) -> str:
+    if n < 0 or n > 0xFFFFFFFF:
+        raise ValueError(f"out of DWORD range: {n}")
+    return f"{n:08x}"
+
+
+def utf16le_multi_sz_hex(items: list[str]) -> str:
+    """REG_MULTI_SZ as the body of a .reg `hex(7):` value: UTF-16LE of each
+    item NUL-terminated, plus a final empty-string terminator."""
+    buf = bytearray()
+    for s in items:
+        buf += s.encode("utf-16-le")
+        buf += b"\x00\x00"
+    buf += b"\x00\x00"
+    return ",".join(f"{b:02x}" for b in buf)
+
+
+def render_reg(template_path: Path, subs: dict[str, str]) -> str:
+    text = template_path.read_text()
+    for k, v in subs.items():
+        text = text.replace(f"@{k}@", v)
+    # Refuse to apply a template with un-substituted tokens — they would
+    # silently corrupt the registry.
+    if "@" in text:
+        # Tolerate `@="..."` (default-value syntax in .reg) by stripping
+        # those before checking.
+        check = text.replace('@="', '__DEFAULT__="')
+        if "@" in check:
+            leftover = [
+                line for line in check.splitlines()
+                if "@" in line and not line.lstrip().startswith(";")
+            ]
+            if leftover:
+                raise RuntimeError(
+                    f"unsubstituted @TOKEN@ in {template_path}: {leftover[0]!r}"
+                )
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Wine invocations
+# ---------------------------------------------------------------------------
+
+def wine_env(pfx: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(pfx)
+    # Suppress wineboot/mono/gecko prompts during regedit.
+    env.setdefault("WINEDLLOVERRIDES", "mscoree,mshtml=")
+    env.setdefault("DISPLAY", env.get("DISPLAY", ""))
+    env["WINEDEBUG"] = env.get("WINEDEBUG", "-all")
+    return env
+
+
+def run_wine_regedit(wine: Path, pfx: Path, reg_text: str) -> int:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".reg", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(reg_text)
+        reg_file = tf.name
+    try:
+        cmd = [str(wine), "regedit", "/S", reg_file]
+        dbg(f"running: WINEPREFIX={pfx} {' '.join(cmd)}")
+        proc = subprocess.run(
+            cmd,
+            env=wine_env(pfx),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode != 0:
+            warn(f"wine regedit exited {proc.returncode}: "
+                 f"{proc.stderr.decode(errors='replace').strip()}")
+        return proc.returncode
+    finally:
+        try:
+            os.unlink(reg_file)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Install / uninstall sweep
+# ---------------------------------------------------------------------------
+
+# Files any bridge might leave behind, keyed by bridge name.
+KNOWN_BRIDGE_FILES: dict[str, list[tuple[str, str]]] = {
+    # (subdir, filename)
+    "wineasio": [
+        ("system32", "wineasio.dll"),
+        ("syswow64", "wineasio.dll"),
+    ],
+    "pwasio": [
+        ("system32", "pwasio.dll"),
+        ("syswow64", "pwasio.dll"),
+    ],
+}
+
+
+def sweep_other_bridges(pfx: Path, active_bridge: str, wine64: Path) -> None:
+    """Remove DLLs and registry entries from any bridge other than the
+    active one. Best-effort; failures only warn."""
+    for other in KNOWN_BRIDGES:
+        if other == active_bridge:
+            continue
+        # Files
+        for sub, name in KNOWN_BRIDGE_FILES.get(other, []):
+            f = pfx / "drive_c/windows" / sub / name
+            if f.exists():
+                try:
+                    f.unlink()
+                    dbg(f"swept stale DLL: {f}")
+                except OSError as e:
+                    warn(f"could not remove {f}: {e}")
+        # Registry — apply uninstall.reg if we can find one in any share dir.
+        for d in share_dir_candidates():
+            unreg = d / other / f"{other}-uninstall.reg"
+            if unreg.is_file():
+                rc = run_wine_regedit(wine64, pfx, unreg.read_text())
+                if rc == 0:
+                    dbg(f"applied {unreg}")
+                else:
+                    warn(f"uninstall.reg for {other} returned {rc}")
+                break
+
+
+def install_bridge(
+    pfx: Path,
+    bridge: str,
+    bdir: Path,
+    manifest: dict[str, str],
+    wine64: Path,
+    subs: dict[str, str],
+) -> bool:
+    target = manifest.get("target")
+    if not target:
+        err(f"manifest missing 'target' for {bridge}")
+        return False
+
+    sys32 = pfx / "drive_c/windows/system32"
+    syswow = pfx / "drive_c/windows/syswow64"
+
+    if not sys32.is_dir():
+        warn(f"prefix not initialized ({sys32} missing); deferring to next launch")
+        return False
+
+    sweep_other_bridges(pfx, bridge, wine64)
+
+    if "dll64" in manifest:
+        src = bdir / manifest["dll64"]
+        dst = sys32 / target
+        shutil.copyfile(src, dst)
+        dbg(f"installed {dst}")
+
+    if "dll32" in manifest:
+        if syswow.is_dir():
+            src = bdir / manifest["dll32"]
+            dst = syswow / target
+            shutil.copyfile(src, dst)
+            dbg(f"installed {dst}")
+        else:
+            warn(f"{syswow} missing; 32-bit DLL not installed (64-bit-only prefix?)")
+
+    reg_template = bdir / manifest.get("reg", f"{bridge}.reg.template")
+    try:
+        reg_text = render_reg(reg_template, subs)
+    except (OSError, RuntimeError) as e:
+        err(f"could not render {reg_template}: {e}")
+        return False
+
+    rc = run_wine_regedit(wine64, pfx, reg_text)
+    if rc != 0:
+        warn(f"regedit returned {rc}; install may be partial")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Substitutions from env
+# ---------------------------------------------------------------------------
+
+def parse_int_env(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        v = int(raw, 0)
+    except ValueError:
+        warn(f"{name}={raw!r} is not an integer; using default {default}")
+        return default
+    if not (lo <= v <= hi):
+        warn(f"{name}={v} out of range [{lo},{hi}]; using default {default}")
+        return default
+    return v
+
+
+def derive_client_name() -> str:
+    explicit = os.environ.get("PROTON_ASIO_CLIENT_NAME")
+    if explicit:
+        return explicit
+    appid = os.environ.get("SteamAppId") or os.environ.get("SteamGameId")
+    if appid:
+        return f"proton-asio-{appid}"
+    return "proton-asio"
+
+
+def build_substitutions(bridge: str) -> dict[str, str]:
+    inputs = parse_int_env("PROTON_ASIO_INPUTS", 2, 1, 64)
+    outputs = parse_int_env("PROTON_ASIO_OUTPUTS", 2, 1, 64)
+    buffer_ = parse_int_env("PROTON_ASIO_BUFFER", 256, 16, 8192)
+    sr = parse_int_env("PROTON_ASIO_SR", 48000, 8000, 384000)
+    client = derive_client_name()
+
+    subs = {
+        "INPUTS_HEX": hex_dword(inputs),
+        "OUTPUTS_HEX": hex_dword(outputs),
+        "BUFFER_HEX": hex_dword(buffer_),
+        "SAMPLE_RATE_HEX": hex_dword(sr),
+        "CLIENT_NAME": client,
+    }
+
+    if bridge == "pwasio":
+        subs["INPUT_NAMES_MULTI_SZ"] = utf16le_multi_sz_hex(
+            [f"Input {i+1}" for i in range(inputs)]
+        )
+        subs["OUTPUT_NAMES_MULTI_SZ"] = utf16le_multi_sz_hex(
+            [f"Output {i+1}" for i in range(outputs)]
+        )
+
+    return subs
+
+
+# ---------------------------------------------------------------------------
+# Anti-cheat / runtime warnings (debug-only)
+# ---------------------------------------------------------------------------
+
+def warn_anti_cheat_if_debug() -> None:
+    if not DEBUG:
+        return
+    install_path = os.environ.get("STEAM_COMPAT_INSTALL_PATH")
+    if not install_path:
+        return
+    p = Path(install_path)
+    markers = [
+        "EasyAntiCheat", "EasyAntiCheat_EOS", "BattlEye",
+        "BattlEye_x64", "anticheat",
+    ]
+    found: list[str] = []
+    try:
+        names = {child.name for child in p.iterdir()}
+    except OSError:
+        return
+    for m in markers:
+        if m in names:
+            found.append(m)
+    if found:
+        warn(
+            f"anti-cheat directory present in game install ({', '.join(found)}); "
+            f"ASIO DLL loading may be blocked by EAC/BattlEye"
+        )
+
+
+def warn_audio_backend_if_debug(bridge: str) -> None:
+    if not DEBUG:
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        warn("XDG_RUNTIME_DIR unset; PipeWire/JACK socket discovery will fail")
+        return
+    pipewire_socket = Path(runtime) / "pipewire-0"
+    if pipewire_socket.exists():
+        return
+    if bridge == "pwasio":
+        warn(f"{pipewire_socket} not found; pwasio will not be reachable")
+    else:
+        warn(
+            f"{pipewire_socket} not found; if you don't have a real JACK "
+            "server, wineasio will fail to connect"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: --uninstall
+# ---------------------------------------------------------------------------
+
+def uninstall_subcommand(prefix: str | None) -> int:
+    pfx = Path(prefix) if prefix else None
+    if not pfx and (s := os.environ.get("STEAM_COMPAT_DATA_PATH")):
+        pfx = Path(s) / "pfx"
+    if not pfx or not pfx.is_dir():
+        err("--uninstall requires a prefix path or STEAM_COMPAT_DATA_PATH")
+        return 2
+
+    # We need a Wine binary; without a Proton dir from argv/env, look for
+    # files/bin/wine64 alongside the prefix's parent (Proton-style layouts
+    # don't keep wine in pfx, so this is best-effort).
+    wine64 = None
+    paths_env = os.environ.get("STEAM_COMPAT_TOOL_PATHS", "")
+    for entry in paths_env.split(":"):
+        if entry:
+            p = Path(entry)
+            if _proton_dir_looks_real(p):
+                wine64, _ = find_wine_binaries(p)
+                if wine64:
+                    break
+    if not wine64:
+        err("could not locate a Wine binary; run --uninstall with "
+            "STEAM_COMPAT_TOOL_PATHS pointing at the active Proton")
+        return 3
+
+    for bridge in KNOWN_BRIDGES:
+        for sub, name in KNOWN_BRIDGE_FILES.get(bridge, []):
+            f = pfx / "drive_c/windows" / sub / name
+            if f.exists():
+                try:
+                    f.unlink()
+                    log(f"removed {f}")
+                except OSError as e:
+                    warn(f"could not remove {f}: {e}")
+        for d in share_dir_candidates():
+            unreg = d / bridge / f"{bridge}-uninstall.reg"
+            if unreg.is_file():
+                run_wine_regedit(wine64, pfx, unreg.read_text())
+                break
+
+    marker = pfx / MARKER_NAME
+    if marker.exists():
+        marker.unlink()
+        log(f"removed {marker}")
+
+    log("uninstall complete")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def split_own_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    """Split out our own flags from the trailing Proton invocation.
+
+    We accept a small set of long flags that must come before %command%.
+    Everything from the first non-flag arg onwards is the passthrough."""
+    own: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            i += 1
+            break
+        if a.startswith("--"):
+            own.append(a)
+            if "=" not in a and a not in ("--help", "--version", "--debug"):
+                # Flags that take a value
+                if i + 1 < len(argv):
+                    own.append(argv[i + 1])
+                    i += 1
+            i += 1
+            continue
+        break
+    parser = argparse.ArgumentParser(
+        prog="proton-asio",
+        add_help=False,
+        description="Add ASIO support to a Proton prefix on game launch.",
+    )
+    parser.add_argument("--help", "-h", action="store_true")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--uninstall", metavar="PREFIX", nargs="?", const="")
+    ns = parser.parse_args(own)
+    return ns, argv[i:]
+
+
+HELP_TEXT = """\
+Usage: proton-asio [--debug] %command%
+
+Insert into Steam launch options:
+    PROTON_ASIO=1 proton-asio %command%
+
+Environment:
+    PROTON_ASIO              "1" enables, anything else is no-op
+    PROTON_ASIO_BRIDGE       wineasio (default) | pwasio
+    PROTON_ASIO_BUFFER       buffer size in samples (default 256)
+    PROTON_ASIO_SR           sample rate (default 48000)
+    PROTON_ASIO_INPUTS       input channels (default 2)
+    PROTON_ASIO_OUTPUTS      output channels (default 2)
+    PROTON_ASIO_CLIENT_NAME  JACK/PipeWire client name (default: proton-asio-<SteamAppId>)
+    PROTON_ASIO_DEBUG        "1" to log every step to stderr
+    PROTON_ASIO_FORCE_REINSTALL  "1" to ignore the marker and reinstall
+    PROTON_ASIO_SHARE_DIR    override the share/proton-asio search path
+
+Subcommands:
+    proton-asio --uninstall [PREFIX]   remove all bridges from a prefix
+    proton-asio --version
+    proton-asio --help
+"""
+
+
+def main(argv: list[str]) -> int:
+    ns, passthrough = split_own_args(argv[1:])
+
+    if ns.help:
+        print(HELP_TEXT)
+        return 0
+    if ns.version:
+        print(f"proton-asio {TOOL_VERSION}")
+        return 0
+    if ns.uninstall is not None:
+        return uninstall_subcommand(ns.uninstall or None)
+
+    # No-op fast path. This MUST be the first thing we do for non-ASIO games.
+    if os.environ.get("PROTON_ASIO") != "1":
+        if not passthrough:
+            err("nothing to exec (no %command% after proton-asio)")
+            return 2
+        os.execvp(passthrough[0], passthrough)
+
+    # ASIO requested. From here on, all failures fall through to exec.
+    if not passthrough:
+        err("PROTON_ASIO=1 but no %command% was provided")
+        return 2
+
+    bridge = os.environ.get("PROTON_ASIO_BRIDGE", DEFAULT_BRIDGE).strip()
+    if bridge not in KNOWN_BRIDGES:
+        warn(f"unknown PROTON_ASIO_BRIDGE={bridge!r}; valid: "
+             f"{', '.join(KNOWN_BRIDGES)}. proceeding without ASIO.")
+        os.execvp(passthrough[0], passthrough)
+
+    try:
+        do_install(bridge, passthrough)
+    except Exception as e:  # noqa: BLE001 — never block the game on our bugs
+        err(f"unexpected failure during install: {e}; launching without ASIO")
+        if DEBUG:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
+    os.execvp(passthrough[0], passthrough)
+
+
+def do_install(bridge: str, passthrough: list[str]) -> None:
+    bdir = find_bridge_dir(bridge)
+    if not bdir:
+        warn(f"bridge files for {bridge!r} not found in any share dir; "
+             f"run `make install` first. launching without ASIO.")
+        return
+
+    manifest = read_manifest(bdir)
+    dll_paths = manifest_dll_paths(bdir, manifest)
+    if not dll_paths:
+        warn(f"no DLLs listed in manifest for {bridge}; launching without ASIO")
+        return
+
+    if bridge == "pwasio" and "dll32" not in manifest:
+        # 64-bit-only bridge. We don't know the game's bitness here, but if
+        # the prefix is wow64-enabled (drive_c/windows/syswow64 exists) the
+        # game *might* be 32-bit. We still install — the worst case is that
+        # the game is 32-bit and pwasio.dll is missing from syswow64, which
+        # is exactly what would happen with no tool involved.
+        dbg("pwasio is 64-bit-only; 32-bit games will not see ASIO")
+
+    compat = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    if not compat:
+        warn("STEAM_COMPAT_DATA_PATH unset; cannot locate prefix")
+        return
+    pfx = Path(compat) / "pfx"
+    if not pfx.is_dir():
+        warn(f"prefix {pfx} does not exist yet; Proton will create it. "
+             "ASIO will be installed on the next launch.")
+        return
+
+    proton_dir = find_proton_dir(passthrough)
+    if not proton_dir:
+        warn("could not locate Proton dir from STEAM_COMPAT_TOOL_PATHS or argv; "
+             "launching without ASIO")
+        return
+    wine64, _ = find_wine_binaries(proton_dir)
+    if not wine64:
+        warn(f"no wine64 under {proton_dir}; launching without ASIO")
+        return
+
+    expected = expected_marker(bridge, manifest, dll_paths)
+    if os.environ.get("PROTON_ASIO_FORCE_REINSTALL") != "1":
+        existing = read_marker(pfx)
+        if existing == expected:
+            dbg("marker matches; skipping install")
+            warn_anti_cheat_if_debug()
+            warn_audio_backend_if_debug(bridge)
+            return
+        if existing is not None:
+            dbg(f"marker mismatch:\n  have: {existing}\n  want: {expected}")
+
+    log(f"installing {bridge} into {pfx}")
+    subs = build_substitutions(bridge)
+    ok = install_bridge(pfx, bridge, bdir, manifest, wine64, subs)
+    if ok:
+        try:
+            write_marker(pfx, expected)
+            dbg("marker written")
+        except OSError as e:
+            warn(f"could not write marker: {e}")
+        log(f"{bridge} installed")
+    warn_anti_cheat_if_debug()
+    warn_audio_backend_if_debug(bridge)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

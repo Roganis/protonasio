@@ -1,0 +1,24 @@
+# BRIDGES.lock — pinned bridge sources for reproducible builds.
+#
+# Regenerate with `make -C build lock` after editing the upstream `ref`
+# fields below. The build will refuse to proceed unless `commit` and
+# `archive_sha256` are filled in and the downloaded tarball matches.
+#
+# Format: simple `key = value` lines, sectioned by `[bridge]` headers.
+# Comments start with `#`. No quoting; values are stripped.
+
+[wineasio]
+url = https://github.com/wineasio/wineasio
+ref = v1.3.0
+# Filled in by `make -C build lock`. Until that runs in your tree,
+# `make build` will error out with a clear message rather than guess.
+commit =
+archive_sha256 =
+
+[pwasio]
+url = https://github.com/golfiros/pwasio
+# pwasio has no tagged releases yet; pin a commit on `main` instead.
+# Bump `ref` to a specific full commit SHA and rerun `make lock`.
+ref = main
+commit =
+archive_sha256 =

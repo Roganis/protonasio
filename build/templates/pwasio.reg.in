@@ -1,0 +1,41 @@
+REGEDIT4
+
+; ---------------------------------------------------------------------------
+; pwasio COM registration + driver-list entry + user defaults.
+;
+; @CLSID@ is filled in at build time. @BUFFER_HEX@, @SAMPLE_RATE_HEX@,
+; @INPUT_NAMES_MULTI_SZ@, @OUTPUT_NAMES_MULTI_SZ@ are filled in at install
+; time by proton-asio. pwasio is 64-bit-only upstream; we still register
+; under Wow6432Node so a Wow64 prefix doesn't see a stale half-state from a
+; previous install.
+; ---------------------------------------------------------------------------
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\@CLSID@]
+@="pwasio Object"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\@CLSID@\InprocServer32]
+@="pwasio.dll"
+"ThreadingModel"="Apartment"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\Wow6432Node\CLSID\@CLSID@]
+@="pwasio Object"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\Wow6432Node\CLSID\@CLSID@\InprocServer32]
+@="pwasio.dll"
+"ThreadingModel"="Apartment"
+
+[HKEY_LOCAL_MACHINE\Software\ASIO\pwasio]
+"CLSID"="@CLSID@"
+"Description"="pwasio (PipeWire ASIO)"
+
+[HKEY_LOCAL_MACHINE\Software\Wow6432Node\ASIO\pwasio]
+"CLSID"="@CLSID@"
+"Description"="pwasio (PipeWire ASIO)"
+
+[HKEY_CURRENT_USER\Software\ASIO\pwasio]
+"buffer_size"=dword:@BUFFER_HEX@
+"sample_rate"=dword:@SAMPLE_RATE_HEX@
+"priority"=dword:00000050
+"host_priority"=dword:00000050
+"inputs"=hex(7):@INPUT_NAMES_MULTI_SZ@
+"outputs"=hex(7):@OUTPUT_NAMES_MULTI_SZ@

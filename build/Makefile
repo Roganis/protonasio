@@ -1,0 +1,183 @@
+# Build the ASIO bridges into ../share/proton-asio/<bridge>/.
+#
+# Inputs:
+#   build/BRIDGES.lock        pinned commits + tarball SHA-256s
+#   build/templates/*.reg.in  registry templates with @CLSID@ placeholders
+#
+# Outputs:
+#   ../share/proton-asio/wineasio/{wineasio32.dll,wineasio64.dll,
+#       wineasio.reg.template,wineasio-uninstall.reg,manifest.txt}
+#   ../share/proton-asio/pwasio/{pwasio64.dll,pwasio.reg.template,
+#       pwasio-uninstall.reg,manifest.txt}
+#
+# Toolchain: Wine devel (winegcc, winebuild) + the upstream Makefile of each
+# bridge. See ../BUILDING.md.
+
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
+BUILD_DIR  := $(abspath .)
+REPO_ROOT  := $(abspath ..)
+WORK_DIR   := $(BUILD_DIR)/.work
+SHARE_DIR  := $(REPO_ROOT)/share/proton-asio
+TEMPLATES  := $(BUILD_DIR)/templates
+LOCK       := $(BUILD_DIR)/BRIDGES.lock
+
+GEN_REG     := python3 $(BUILD_DIR)/gen-reg.py
+EXTRACT     := python3 $(BUILD_DIR)/extract-clsid.py
+LOCK_SCRIPT := python3 $(BUILD_DIR)/lock.py
+
+# Deterministic output: SOURCE_DATE_EPOCH is set per-bridge from the upstream
+# commit's author date inside the per-bridge target.
+export LC_ALL := C
+
+# Read a key from a [section] in BRIDGES.lock. Used by per-bridge targets.
+# Usage: $(call lock_get,section,key)
+define lock_get
+$(shell awk -v section="$(1)" -v key="$(2)" '\
+  /^\[/ { in_section = ($$0 == "[" section "]") } \
+  in_section && $$1 == key && $$2 == "=" { print $$3; exit }' $(LOCK))
+endef
+
+.PHONY: build build-wineasio build-pwasio clean lock check-lock dirs
+
+build: build-wineasio build-pwasio
+	@echo "build complete: $(SHARE_DIR)"
+
+dirs:
+	@mkdir -p "$(WORK_DIR)" "$(SHARE_DIR)"
+
+lock:
+	$(LOCK_SCRIPT)
+
+# Refuse to build if the lockfile is unresolved.
+check-lock: $(LOCK)
+	@for s in wineasio pwasio; do \
+	    commit=$$(awk -v sect="[$$s]" '\
+	        $$0 == sect { in_section = 1; next } \
+	        /^\[/       { in_section = 0 } \
+	        in_section && $$1 == "commit" { print $$3; exit }' $(LOCK)); \
+	    sha=$$(awk -v sect="[$$s]" '\
+	        $$0 == sect { in_section = 1; next } \
+	        /^\[/       { in_section = 0 } \
+	        in_section && $$1 == "archive_sha256" { print $$3; exit }' $(LOCK)); \
+	    if [[ -z "$$commit" || -z "$$sha" ]]; then \
+	        echo "BRIDGES.lock for [$$s] is unresolved (commit/sha empty)." >&2; \
+	        echo "Run 'make -C build lock' to populate it." >&2; \
+	        exit 1; \
+	    fi; \
+	done
+
+# ---------------------------------------------------------------------------
+# wineasio
+# ---------------------------------------------------------------------------
+
+WINEASIO_URL    = $(call lock_get,wineasio,url)
+WINEASIO_COMMIT = $(call lock_get,wineasio,commit)
+WINEASIO_SHA    = $(call lock_get,wineasio,archive_sha256)
+WINEASIO_REF    = $(call lock_get,wineasio,ref)
+WINEASIO_TAR    = $(WORK_DIR)/wineasio-$(WINEASIO_COMMIT).tar.gz
+WINEASIO_SRC    = $(WORK_DIR)/wineasio-$(WINEASIO_COMMIT)
+WINEASIO_OUT    = $(SHARE_DIR)/wineasio
+
+build-wineasio: check-lock dirs
+	@echo "[wineasio] commit $(WINEASIO_COMMIT)"
+	@if [[ ! -f "$(WINEASIO_TAR)" ]]; then \
+	    echo "[wineasio] downloading tarball..."; \
+	    curl -fLsS -o "$(WINEASIO_TAR).part" \
+	        "https://codeload.github.com/$$( \
+	          echo $(WINEASIO_URL) | sed -E 's|https?://github\.com/||; s|\.git$$||')/\
+tar.gz/$(WINEASIO_COMMIT)"; \
+	    mv "$(WINEASIO_TAR).part" "$(WINEASIO_TAR)"; \
+	fi
+	@echo "[wineasio] verifying sha256..."
+	@printf '%s  %s\n' "$(WINEASIO_SHA)" "$(WINEASIO_TAR)" | sha256sum -c -
+	@rm -rf "$(WINEASIO_SRC)" "$(WINEASIO_SRC).extract"
+	@mkdir -p "$(WINEASIO_SRC).extract"
+	@tar -xzf "$(WINEASIO_TAR)" -C "$(WINEASIO_SRC).extract"
+	@mv "$(WINEASIO_SRC).extract"/wineasio-* "$(WINEASIO_SRC)"
+	@rmdir "$(WINEASIO_SRC).extract"
+	@echo "[wineasio] cross-compiling 32-bit and 64-bit..."
+	@cd "$(WINEASIO_SRC)" && \
+	    SOURCE_DATE_EPOCH=$$(git -C "$(WINEASIO_SRC)" log -1 --format=%ct 2>/dev/null \
+	        || echo 1700000000) \
+	    $(MAKE) 64 && \
+	    SOURCE_DATE_EPOCH=$$(git -C "$(WINEASIO_SRC)" log -1 --format=%ct 2>/dev/null \
+	        || echo 1700000000) \
+	    $(MAKE) 32
+	@mkdir -p "$(WINEASIO_OUT)"
+	@cp "$(WINEASIO_SRC)/build64/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll" \
+	    || cp "$(WINEASIO_SRC)/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll"
+	@cp "$(WINEASIO_SRC)/build32/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll" \
+	    || cp "$(WINEASIO_SRC)/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll"
+	@echo "[wineasio] extracting CLSID from source..."
+	@CLSID=$$($(EXTRACT) "$(WINEASIO_SRC)" CLSID_WineASIO); \
+	    echo "[wineasio] CLSID = $$CLSID"; \
+	    $(GEN_REG) --clsid "$$CLSID" \
+	        --in "$(TEMPLATES)/wineasio.reg.in" \
+	        --out "$(WINEASIO_OUT)/wineasio.reg.template"; \
+	    $(GEN_REG) --clsid "$$CLSID" \
+	        --in "$(TEMPLATES)/wineasio-uninstall.reg.in" \
+	        --out "$(WINEASIO_OUT)/wineasio-uninstall.reg"
+	@printf 'version=%s\ntarget=wineasio.dll\ndll64=wineasio64.dll\ndll32=wineasio32.dll\nreg=wineasio.reg.template\nuninstall_reg=wineasio-uninstall.reg\n' \
+	    "$(WINEASIO_REF)" > "$(WINEASIO_OUT)/manifest.txt"
+	@echo "[wineasio] -> $(WINEASIO_OUT)"
+
+# ---------------------------------------------------------------------------
+# pwasio
+# ---------------------------------------------------------------------------
+
+PWASIO_URL    = $(call lock_get,pwasio,url)
+PWASIO_COMMIT = $(call lock_get,pwasio,commit)
+PWASIO_SHA    = $(call lock_get,pwasio,archive_sha256)
+PWASIO_REF    = $(call lock_get,pwasio,ref)
+PWASIO_TAR    = $(WORK_DIR)/pwasio-$(PWASIO_COMMIT).tar.gz
+PWASIO_SRC    = $(WORK_DIR)/pwasio-$(PWASIO_COMMIT)
+PWASIO_OUT    = $(SHARE_DIR)/pwasio
+
+build-pwasio: check-lock dirs
+	@echo "[pwasio] commit $(PWASIO_COMMIT)"
+	@if [[ ! -f "$(PWASIO_TAR)" ]]; then \
+	    echo "[pwasio] downloading tarball..."; \
+	    curl -fLsS -o "$(PWASIO_TAR).part" \
+	        "https://codeload.github.com/$$( \
+	          echo $(PWASIO_URL) | sed -E 's|https?://github\.com/||; s|\.git$$||')/\
+tar.gz/$(PWASIO_COMMIT)"; \
+	    mv "$(PWASIO_TAR).part" "$(PWASIO_TAR)"; \
+	fi
+	@echo "[pwasio] verifying sha256..."
+	@printf '%s  %s\n' "$(PWASIO_SHA)" "$(PWASIO_TAR)" | sha256sum -c -
+	@rm -rf "$(PWASIO_SRC)" "$(PWASIO_SRC).extract"
+	@mkdir -p "$(PWASIO_SRC).extract"
+	@tar -xzf "$(PWASIO_TAR)" -C "$(PWASIO_SRC).extract"
+	@mv "$(PWASIO_SRC).extract"/pwasio-* "$(PWASIO_SRC)"
+	@rmdir "$(PWASIO_SRC).extract"
+	@echo "[pwasio] building (64-bit)..."
+	@cd "$(PWASIO_SRC)" && SOURCE_DATE_EPOCH=1700000000 $(MAKE)
+	@mkdir -p "$(PWASIO_OUT)"
+	@# Upstream produces lib/wine/x86_64-windows/pwasio.dll. Locate it
+	@# robustly across release layouts.
+	@DLL=$$(find "$(PWASIO_SRC)" -name pwasio.dll -path '*x86_64-windows*' \
+	    -o -name pwasio.dll | head -1); \
+	    if [[ -z "$$DLL" ]]; then \
+	        echo "pwasio.dll not produced — check upstream Makefile" >&2; \
+	        exit 1; \
+	    fi; \
+	    cp "$$DLL" "$(PWASIO_OUT)/pwasio64.dll"
+	@echo "[pwasio] extracting CLSID from source..."
+	@CLSID=$$($(EXTRACT) "$(PWASIO_SRC)" CLSID_pwasio \
+	    || $(EXTRACT) "$(PWASIO_SRC)" CLSID_PWASIO); \
+	    echo "[pwasio] CLSID = $$CLSID"; \
+	    $(GEN_REG) --clsid "$$CLSID" \
+	        --in "$(TEMPLATES)/pwasio.reg.in" \
+	        --out "$(PWASIO_OUT)/pwasio.reg.template"; \
+	    $(GEN_REG) --clsid "$$CLSID" \
+	        --in "$(TEMPLATES)/pwasio-uninstall.reg.in" \
+	        --out "$(PWASIO_OUT)/pwasio-uninstall.reg"
+	@printf 'version=%s+%s\ntarget=pwasio.dll\ndll64=pwasio64.dll\nreg=pwasio.reg.template\nuninstall_reg=pwasio-uninstall.reg\n' \
+	    "$(PWASIO_REF)" "$$(echo $(PWASIO_COMMIT) | cut -c1-12)" \
+	    > "$(PWASIO_OUT)/manifest.txt"
+	@echo "[pwasio] -> $(PWASIO_OUT)"
+
+clean:
+	rm -rf "$(WORK_DIR)" "$(SHARE_DIR)"

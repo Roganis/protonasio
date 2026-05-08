@@ -1,0 +1,11 @@
+REGEDIT4
+
+; Remove every key proton-asio's wineasio.reg.template installs.
+; Used during bridge-switch sweeps and on `proton-asio --uninstall`.
+; @CLSID@ is filled in at build time.
+
+[-HKEY_LOCAL_MACHINE\Software\Classes\CLSID\@CLSID@]
+[-HKEY_LOCAL_MACHINE\Software\Classes\Wow6432Node\CLSID\@CLSID@]
+[-HKEY_LOCAL_MACHINE\Software\ASIO\WineASIO]
+[-HKEY_LOCAL_MACHINE\Software\Wow6432Node\ASIO\WineASIO]
+[-HKEY_CURRENT_USER\Software\Wine\WineASIO]

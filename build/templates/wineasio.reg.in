@@ -1,0 +1,46 @@
+REGEDIT4
+
+; ---------------------------------------------------------------------------
+; WineASIO COM registration + driver-list entry + user defaults.
+;
+; @CLSID@ is filled in at build time by build/gen-reg.py from the bridge
+; source. @INPUTS_HEX@ etc. are filled in at install time by proton-asio.
+;
+; Both 64-bit and 32-bit (Wow6432Node) views are written so that the same
+; prefix can host either bitness of game.
+; ---------------------------------------------------------------------------
+
+; --- 64-bit COM CLSID ---
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\@CLSID@]
+@="WineASIO Object"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\@CLSID@\InprocServer32]
+@="wineasio.dll"
+"ThreadingModel"="Apartment"
+
+; --- 32-bit (Wow64) COM CLSID ---
+[HKEY_LOCAL_MACHINE\Software\Classes\Wow6432Node\CLSID\@CLSID@]
+@="WineASIO Object"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\Wow6432Node\CLSID\@CLSID@\InprocServer32]
+@="wineasio.dll"
+"ThreadingModel"="Apartment"
+
+; --- ASIO driver enumeration (64-bit view) ---
+[HKEY_LOCAL_MACHINE\Software\ASIO\WineASIO]
+"CLSID"="@CLSID@"
+"Description"="WineASIO Driver"
+
+; --- ASIO driver enumeration (32-bit view) ---
+[HKEY_LOCAL_MACHINE\Software\Wow6432Node\ASIO\WineASIO]
+"CLSID"="@CLSID@"
+"Description"="WineASIO Driver"
+
+; --- WineASIO user defaults ---
+[HKEY_CURRENT_USER\Software\Wine\WineASIO]
+"Number of inputs"=dword:@INPUTS_HEX@
+"Number of outputs"=dword:@OUTPUTS_HEX@
+"Autostart server"=dword:00000000
+"Connect to hardware"=dword:00000001
+"Fixed buffersize"=dword:00000001
+"Preferred buffersize"=dword:@BUFFER_HEX@
