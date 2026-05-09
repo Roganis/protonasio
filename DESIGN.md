@@ -176,10 +176,35 @@ proton-asio argv:
   8. exec argv[1:]   ← unmodified Proton invocation
 ```
 
-Setup is one Wine invocation total: a single `regedit /S` against a static,
-build-time-generated `.reg` file containing both the COM CLSID registration
-and the `HKCU\Software\Wine\WineASIO` (or `HKCU\Software\ASIO\pwasio`)
-defaults. No `regsvr32`, no per-launch shellouts beyond the one `regedit`.
+Setup invocations differ by bridge, controlled by `install_method` in
+each bridge's `manifest.txt`:
+
+- **wineasio** (`install_method=reg`, default): one Wine call —
+  `regedit /S` against a build-time-generated `.reg` containing the COM
+  CLSID + driver-list + `HKCU\Software\Wine\WineASIO` defaults. The
+  CLSID is extracted from the bridge source by `build/extract-clsid.py`
+  and substituted into the template by `build/gen-reg.py`, so a
+  wineasio bump can't desync the .reg.
+- **pwasio** (`install_method=regsvr32`): two Wine calls — `regsvr32`
+  to invoke pwasio's own `DllRegisterServer` (the authoritative source
+  for its CLSID + HKLM driver-list entries; reproducing them by hand
+  would drift), then `regedit /S` for our small HKCU-only config
+  template (`buffer_size`/`sample_rate`/channel names, the things the
+  user actually tunes via env vars). pwasio defines its CLSID as an
+  inline `static GUID const class_id` in `src/pwasio.h` rather than as
+  a conventionally-named `CLSID_*` symbol, and its `DllRegisterServer`
+  writes more than just CLSID keys, so the .reg-from-extracted-CLSID
+  approach is wrong for it on both counts.
+
+Per-launch overhead in steady state is zero either way: the marker
+short-circuits before any Wine call. The two-call pwasio install path
+fires only on first-launch (or after a bridge switch / version bump),
+which is acceptable.
+
+Sweep order matters for `regsvr32` bridges: `regsvr32 /u` must run
+*before* the DLL is unlinked, since `DllUnregisterServer` runs
+in-process from the DLL itself. The wrapper's
+`uninstall_one_bridge()` enforces this order.
 
 ## Layout
 
@@ -249,8 +274,11 @@ both the DLLs and a `SHA256SUMS` file alongside the release.
 ## Open questions parked for implementation
 
 - Initial values to write into `BRIDGES.lock` for wineasio v1.3.0 and the
-  pinned pwasio `main` commit (resolved at first `make lock`).
+  pinned pwasio default-branch commit (resolved at first `make lock`).
 - Whether to detect EAC/BattlEye by file presence (`EasyAntiCheat/`,
   `BattlEye/`) and warn under `PROTON_ASIO_DEBUG=1`. Cheap; will include.
-- Final CLSID values: extracted at build time from each bridge's source
-  rather than hardcoded, so a bridge upgrade can't desync the `.reg`.
+- wineasio CLSID is extracted at build time from
+  `static const CLSID CLSID_WineASIO`. pwasio doesn't get this
+  treatment — its CLSID is an inline `static GUID const class_id` and
+  its `DllRegisterServer` does more than the .reg approach can
+  reproduce, so we delegate to `regsvr32` instead.

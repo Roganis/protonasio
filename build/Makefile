@@ -208,19 +208,26 @@ tar.gz/$(PWASIO_COMMIT)"; \
 	        exit 1; \
 	    fi; \
 	    cp "$$DLL" "$(PWASIO_OUT)/pwasio64.dll"
-	@echo "[pwasio] extracting CLSID from source..."
-	@CLSID=$$($(EXTRACT) "$(PWASIO_SRC)" CLSID_pwasio \
-	    || $(EXTRACT) "$(PWASIO_SRC)" CLSID_PWASIO); \
-	    echo "[pwasio] CLSID = $$CLSID"; \
-	    $(GEN_REG) --clsid "$$CLSID" \
-	        --in "$(TEMPLATES)/pwasio.reg.in" \
-	        --out "$(PWASIO_OUT)/pwasio.reg.template"; \
-	    $(GEN_REG) --clsid "$$CLSID" \
-	        --in "$(TEMPLATES)/pwasio-uninstall.reg.in" \
-	        --out "$(PWASIO_OUT)/pwasio-uninstall.reg"
-	@printf 'version=%s+%s\ntarget=pwasio.dll\ndll64=pwasio64.dll\nreg=pwasio.reg.template\nuninstall_reg=pwasio-uninstall.reg\n' \
-	    "$(PWASIO_REF)" "$$(echo $(PWASIO_COMMIT) | cut -c1-12)" \
-	    > "$(PWASIO_OUT)/manifest.txt"
+	@# pwasio handles its own COM registration via DllRegisterServer
+	@# (which writes more than just CLSID + InprocServer32: it also adds
+	@# the HKLM driver-list entry and any other state pwasio decides it
+	@# needs). proton-asio drives that with `wine regsvr32 pwasio.dll`
+	@# at install time rather than reproducing it from a hand-built .reg.
+	@# Build-time we only ship the user-config template, which targets
+	@# HKCU\Software\ASIO\pwasio and is independent of the CLSID.
+	@cp "$(TEMPLATES)/pwasio-config.reg.in" \
+	    "$(PWASIO_OUT)/pwasio-config.reg.template"
+	@cp "$(TEMPLATES)/pwasio-config-uninstall.reg" \
+	    "$(PWASIO_OUT)/pwasio-config-uninstall.reg"
+	@{ \
+	    printf 'version=%s+%s\n' \
+	        "$(PWASIO_REF)" "$$(echo $(PWASIO_COMMIT) | cut -c1-12)"; \
+	    printf 'target=pwasio.dll\n'; \
+	    printf 'install_method=regsvr32\n'; \
+	    printf 'dll64=pwasio64.dll\n'; \
+	    printf 'config_reg=pwasio-config.reg.template\n'; \
+	    printf 'config_uninstall_reg=pwasio-config-uninstall.reg\n'; \
+	} > "$(PWASIO_OUT)/manifest.txt"
 	@echo "[pwasio] -> $(PWASIO_OUT)"
 
 clean:

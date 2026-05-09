@@ -211,7 +211,10 @@ cause; switch to wineasio for that game.
 
 **Bridge switch not taking effect.** Switching `PROTON_ASIO_BRIDGE`
 between launches triggers an automatic uninstall sweep of the previous
-bridge before installing the new one. If something's stuck:
+bridge before installing the new one. For pwasio that runs
+`wine regsvr32 /u pwasio.dll` against the prefix before deleting the
+DLL, so its `DllUnregisterServer` gets the chance to clean up properly.
+If something's stuck:
 
 ```sh
 proton-asio --uninstall ~/.local/share/Steam/steamapps/compatdata/<appid>

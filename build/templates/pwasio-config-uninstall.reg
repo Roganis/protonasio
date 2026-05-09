@@ -1,0 +1,7 @@
+REGEDIT4
+
+; Remove pwasio's HKCU user-config keys. The HKLM CLSID + driver-list
+; entries are torn down by `wine regsvr32 /u pwasio.dll` (pwasio's own
+; DllUnregisterServer).
+
+[-HKEY_CURRENT_USER\Software\ASIO\pwasio]

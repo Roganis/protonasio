@@ -266,13 +266,43 @@ def run_wine_regedit(wine: Path, pfx: Path, reg_text: str) -> int:
             pass
 
 
+def run_wine_regsvr32(wine: Path, pfx: Path, dll_name: str,
+                      unregister: bool = False) -> int:
+    """Invoke `wine regsvr32 [/u] /s <dll_name>` against the prefix.
+
+    Used for bridges whose registration logic lives in their own
+    DllRegisterServer (currently only pwasio). The DLL must already
+    have been copied into the prefix's system32/syswow64 — regsvr32
+    locates it by name through the standard Windows search path."""
+    args = [str(wine), "regsvr32", "/s"]
+    if unregister:
+        args.append("/u")
+    args.append(dll_name)
+    dbg(f"running: WINEPREFIX={pfx} {' '.join(args)}")
+    proc = subprocess.run(
+        args,
+        env=wine_env(pfx),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        verb = "unregister" if unregister else "register"
+        warn(f"wine regsvr32 {verb} of {dll_name} exited "
+             f"{proc.returncode}: "
+             f"{proc.stderr.decode(errors='replace').strip()}")
+    return proc.returncode
+
+
 # ---------------------------------------------------------------------------
 # Install / uninstall sweep
 # ---------------------------------------------------------------------------
 
-# Files any bridge might leave behind, keyed by bridge name.
+# Filenames each bridge leaves under drive_c/windows/{system32,syswow64},
+# keyed by bridge name. Used as a defensive fallback when sweeping a
+# bridge whose manifest we can't find on the host (e.g. user uninstalled
+# the share/ files between launches).
 KNOWN_BRIDGE_FILES: dict[str, list[tuple[str, str]]] = {
-    # (subdir, filename)
     "wineasio": [
         ("system32", "wineasio.dll"),
         ("syswow64", "wineasio.dll"),
@@ -284,31 +314,79 @@ KNOWN_BRIDGE_FILES: dict[str, list[tuple[str, str]]] = {
 }
 
 
+def find_bridge_manifest(bridge: str) -> tuple[Path, dict[str, str]] | None:
+    """Same as find_bridge_dir but also returns the parsed manifest."""
+    bdir = find_bridge_dir(bridge)
+    if not bdir:
+        return None
+    try:
+        return bdir, read_manifest(bdir)
+    except OSError as e:
+        warn(f"could not read manifest for {bridge}: {e}")
+        return None
+
+
+def uninstall_one_bridge(bridge: str, pfx: Path, wine64: Path) -> None:
+    """Tear down a previous install of `bridge` from `pfx`. Used by the
+    bridge-switch sweep and by --uninstall. Order matters when the
+    bridge uses regsvr32: the DLL must still be on disk while
+    DllUnregisterServer runs, so we run regsvr32 /u first and only then
+    delete the DLL."""
+    found = find_bridge_manifest(bridge)
+    bdir, manifest = (None, {}) if found is None else found
+
+    method = manifest.get("install_method", "reg")
+    target = manifest.get("target", KNOWN_BRIDGE_FILES.get(bridge, [(None, None)])[0][1])
+
+    if method == "regsvr32" and target:
+        sys32_dll = pfx / "drive_c/windows/system32" / target
+        if sys32_dll.exists():
+            run_wine_regsvr32(wine64, pfx, target, unregister=True)
+            dbg(f"regsvr32 /u {target} (64-bit)")
+
+    # Files. Delete every known location for this bridge, and the
+    # manifest's recorded target as well.
+    targets: list[tuple[str, str]] = list(KNOWN_BRIDGE_FILES.get(bridge, []))
+    if target:
+        for sub in ("system32", "syswow64"):
+            if (sub, target) not in targets:
+                targets.append((sub, target))
+    for sub, name in targets:
+        f = pfx / "drive_c/windows" / sub / name
+        if f.exists():
+            try:
+                f.unlink()
+                dbg(f"swept stale DLL: {f}")
+            except OSError as e:
+                warn(f"could not remove {f}: {e}")
+
+    # HKCU / leftover-key cleanup. For .reg-managed bridges this is the
+    # main uninstall step; for regsvr32 bridges it covers config keys
+    # that DllUnregisterServer doesn't touch.
+    reg_keys = []
+    if method == "regsvr32":
+        reg_keys.append(manifest.get("config_uninstall_reg"))
+    else:
+        reg_keys.append(manifest.get("uninstall_reg", f"{bridge}-uninstall.reg"))
+    for relname in reg_keys:
+        if not relname or not bdir:
+            continue
+        unreg = bdir / relname
+        if unreg.is_file():
+            rc = run_wine_regedit(wine64, pfx, unreg.read_text())
+            if rc == 0:
+                dbg(f"applied {unreg}")
+            else:
+                warn(f"{unreg.name} returned {rc}")
+
+
 def sweep_other_bridges(pfx: Path, active_bridge: str, wine64: Path) -> None:
-    """Remove DLLs and registry entries from any bridge other than the
+    """Run the uninstall path for every known bridge other than the
     active one. Best-effort; failures only warn."""
     for other in KNOWN_BRIDGES:
         if other == active_bridge:
             continue
-        # Files
-        for sub, name in KNOWN_BRIDGE_FILES.get(other, []):
-            f = pfx / "drive_c/windows" / sub / name
-            if f.exists():
-                try:
-                    f.unlink()
-                    dbg(f"swept stale DLL: {f}")
-                except OSError as e:
-                    warn(f"could not remove {f}: {e}")
-        # Registry — apply uninstall.reg if we can find one in any share dir.
-        for d in share_dir_candidates():
-            unreg = d / other / f"{other}-uninstall.reg"
-            if unreg.is_file():
-                rc = run_wine_regedit(wine64, pfx, unreg.read_text())
-                if rc == 0:
-                    dbg(f"applied {unreg}")
-                else:
-                    warn(f"uninstall.reg for {other} returned {rc}")
-                break
+        uninstall_one_bridge(other, pfx, wine64)
 
 
 def install_bridge(
@@ -358,18 +436,39 @@ def install_bridge(
              "unaffected. To get 32-bit support, rebuild with legacy "
              "(non-WoW64) Wine — see BUILDING.md.")
 
+    method = manifest.get("install_method", "reg")
+    if method == "regsvr32":
+        # pwasio path: let pwasio's own DllRegisterServer write the COM
+        # CLSID + driver-list keys, then apply the small HKCU-only
+        # config reg for our user-tunable defaults.
+        rc = run_wine_regsvr32(wine64, pfx, target, unregister=False)
+        if rc != 0:
+            warn(f"regsvr32 of {target} returned {rc}; install may be partial")
+            return False
+        config_rel = manifest.get("config_reg")
+        if config_rel:
+            try:
+                cfg_text = render_reg(bdir / config_rel, subs)
+            except (OSError, RuntimeError) as e:
+                err(f"could not render {bdir / config_rel}: {e}")
+                return False
+            rc = run_wine_regedit(wine64, pfx, cfg_text)
+            if rc != 0:
+                warn(f"config regedit returned {rc}; defaults not applied")
+                return False
+        return True
+
+    # Default: .reg-managed bridge (wineasio).
     reg_template = bdir / manifest.get("reg", f"{bridge}.reg.template")
     try:
         reg_text = render_reg(reg_template, subs)
     except (OSError, RuntimeError) as e:
         err(f"could not render {reg_template}: {e}")
         return False
-
     rc = run_wine_regedit(wine64, pfx, reg_text)
     if rc != 0:
         warn(f"regedit returned {rc}; install may be partial")
         return False
-
     return True
 
 
@@ -507,19 +606,7 @@ def uninstall_subcommand(prefix: str | None) -> int:
         return 3
 
     for bridge in KNOWN_BRIDGES:
-        for sub, name in KNOWN_BRIDGE_FILES.get(bridge, []):
-            f = pfx / "drive_c/windows" / sub / name
-            if f.exists():
-                try:
-                    f.unlink()
-                    log(f"removed {f}")
-                except OSError as e:
-                    warn(f"could not remove {f}: {e}")
-        for d in share_dir_candidates():
-            unreg = d / bridge / f"{bridge}-uninstall.reg"
-            if unreg.is_file():
-                run_wine_regedit(wine64, pfx, unreg.read_text())
-                break
+        uninstall_one_bridge(bridge, pfx, wine64)
 
     marker = pfx / MARKER_NAME
     if marker.exists():

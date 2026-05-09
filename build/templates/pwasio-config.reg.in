@@ -1,0 +1,23 @@
+REGEDIT4
+
+; ---------------------------------------------------------------------------
+; pwasio user-config defaults (HKCU only).
+;
+; pwasio's COM CLSID + driver-list registration is done via
+; `wine regsvr32 pwasio.dll` against the prefix at install time —
+; pwasio's own DllRegisterServer is the source of truth for those keys
+; and reproducing them here would silently drift on every upstream bump.
+;
+; This file only covers the user-tunable defaults that we expose via
+; PROTON_ASIO_BUFFER / _SR / _INPUTS / _OUTPUTS env vars. proton-asio
+; substitutes the @TOKENS@ at install time. pwasio's DllRegisterServer
+; does NOT touch HKCU, so this is the entire HKCU footprint.
+; ---------------------------------------------------------------------------
+
+[HKEY_CURRENT_USER\Software\ASIO\pwasio]
+"buffer_size"=dword:@BUFFER_HEX@
+"sample_rate"=dword:@SAMPLE_RATE_HEX@
+"priority"=dword:00000050
+"host_priority"=dword:00000050
+"inputs"=hex(7):@INPUT_NAMES_MULTI_SZ@
+"outputs"=hex(7):@OUTPUT_NAMES_MULTI_SZ@
