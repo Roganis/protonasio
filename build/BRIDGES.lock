@@ -19,6 +19,6 @@ archive_sha256 =
 url = https://github.com/golfiros/pwasio
 # pwasio has no tagged releases yet; pin a commit on `main` instead.
 # Bump `ref` to a specific full commit SHA and rerun `make lock`.
-ref = main
+ref = master
 commit =
 archive_sha256 =
