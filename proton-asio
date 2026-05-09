@@ -220,11 +220,32 @@ def read_manifest(bdir: Path) -> dict[str, str]:
 
 
 def manifest_dll_paths(bdir: Path, m: dict[str, str]) -> list[Path]:
+    """All bridge artefacts that should contribute to the marker hash:
+    PE fake-DLLs *and* the matching ELF .dll.so libraries. If any of
+    these change, the install must be redone."""
     paths: list[Path] = []
-    for key in ("dll64", "dll32"):
+    for key in ("dll64", "dll32", "so64", "so32"):
         if key in m:
             paths.append(bdir / m[key])
     return paths
+
+
+# Where in the prefix we deposit the ELF half of each bridge. A
+# dedicated tree under the prefix keeps our files out of system32 and
+# out of the Proton install — we point Wine at it via WINEDLLPATH at
+# launch time. Mirrors Wine's own arch-split layout so the `.dll.so`
+# names don't collide between bitnesses.
+PFX_LIBS_DIR = "proton-asio-libs"
+PFX_LIBS_ARCH = ("x86_64-unix", "i386-unix")
+
+
+def pfx_libs_root(pfx: Path) -> Path:
+    return pfx / PFX_LIBS_DIR
+
+
+def pfx_libs_arch_dirs(pfx: Path) -> tuple[Path, Path]:
+    root = pfx_libs_root(pfx)
+    return root / "x86_64-unix", root / "i386-unix"
 
 
 def sha256_of_files(paths: Iterable[Path]) -> str:
@@ -304,14 +325,54 @@ def render_reg(template_path: Path, subs: dict[str, str]) -> str:
 # Wine invocations
 # ---------------------------------------------------------------------------
 
-def wine_env(pfx: Path) -> dict[str, str]:
+def _prepend_wine_dll_path(value: str, existing: str) -> str:
+    if not existing:
+        return value
+    return f"{value}:{existing}"
+
+
+def wine_env(pfx: Path, with_dll_path: bool = True) -> dict[str, str]:
+    """Environment for Wine subprocesses we spawn at install time.
+
+    Always sets WINEPREFIX. When `with_dll_path` is true (the default
+    for our regedit/regsvr32 calls) we also prepend the prefix's
+    proton-asio-libs/{x86_64,i386}-unix to WINEDLLPATH, so the .so
+    half of a freshly-copied fake-DLL is reachable on the very same
+    install pass — without this, regsvr32 fails for the same reason
+    the game would: load_builtin can't find the ELF library."""
     env = os.environ.copy()
     env["WINEPREFIX"] = str(pfx)
-    # Suppress wineboot/mono/gecko prompts during regedit.
+    # Suppress wineboot/mono/gecko prompts during regedit/regsvr32.
     env.setdefault("WINEDLLOVERRIDES", "mscoree,mshtml=")
     env.setdefault("DISPLAY", env.get("DISPLAY", ""))
     env["WINEDEBUG"] = env.get("WINEDEBUG", "-all")
+    if with_dll_path:
+        existing = []
+        for d in pfx_libs_arch_dirs(pfx):
+            if d.is_dir():
+                existing.append(str(d))
+        if existing:
+            env["WINEDLLPATH"] = _prepend_wine_dll_path(
+                ":".join(existing), env.get("WINEDLLPATH", "")
+            )
     return env
+
+
+def inject_wine_dll_path(pfx: Path) -> None:
+    """Mutate os.environ so a subsequent execvp inherits the WINEDLLPATH
+    pointing at our prefix-local .so dirs. Called right before we exec
+    the original Proton command — it's cheap, idempotent, and noop if
+    the libs root doesn't exist."""
+    paths: list[str] = []
+    for d in pfx_libs_arch_dirs(pfx):
+        if d.is_dir() and any(d.iterdir()):
+            paths.append(str(d))
+    if not paths:
+        return
+    new = ":".join(paths)
+    existing = os.environ.get("WINEDLLPATH", "")
+    os.environ["WINEDLLPATH"] = _prepend_wine_dll_path(new, existing)
+    dbg(f"WINEDLLPATH={os.environ['WINEDLLPATH']}")
 
 
 def run_wine_regedit(wine: Path, pfx: Path, reg_text: str) -> int:
@@ -416,6 +477,9 @@ def uninstall_one_bridge(bridge: str, pfx: Path, wine64: Path) -> None:
     if method == "regsvr32" and target:
         sys32_dll = pfx / "drive_c/windows/system32" / target
         if sys32_dll.exists():
+            # regsvr32 /u must run while the .dll is on disk *and* its
+            # matching .so is reachable on WINEDLLPATH. Both are still
+            # in place at this point — unlink happens after.
             run_wine_regsvr32(wine64, pfx, target, unregister=True)
             dbg(f"regsvr32 /u {target} (64-bit)")
 
@@ -434,6 +498,24 @@ def uninstall_one_bridge(bridge: str, pfx: Path, wine64: Path) -> None:
                 dbg(f"swept stale DLL: {f}")
             except OSError as e:
                 warn(f"could not remove {f}: {e}")
+
+    # ELF .dll.so halves under the prefix's proton-asio-libs/. We
+    # delete by name (target_so from the manifest if available, plus
+    # the conventional "<bridge>.dll.so" fallback so a bridge whose
+    # share/ files are gone still gets cleaned up).
+    so_names = set()
+    if manifest.get("target_so"):
+        so_names.add(manifest["target_so"])
+    so_names.add(f"{bridge}.dll.so")
+    for arch_dir in pfx_libs_arch_dirs(pfx):
+        for name in so_names:
+            f = arch_dir / name
+            if f.exists():
+                try:
+                    f.unlink()
+                    dbg(f"swept stale .so: {f}")
+                except OSError as e:
+                    warn(f"could not remove {f}: {e}")
 
     # HKCU / leftover-key cleanup. For .reg-managed bridges this is the
     # main uninstall step; for regsvr32 bridges it covers config keys
@@ -486,9 +568,22 @@ def install_bridge(
 
     sweep_other_bridges(pfx, bridge, wine64)
 
+    target_so = manifest.get("target_so")
+    if "so64" in manifest and not target_so:
+        err(f"manifest for {bridge} has so64 but no target_so")
+        return False
+
+    libs64, libs32 = pfx_libs_arch_dirs(pfx)
+
     if "dll64" in manifest:
         src = bdir / manifest["dll64"]
         dst = sys32 / target
+        shutil.copyfile(src, dst)
+        dbg(f"installed {dst}")
+    if "so64" in manifest:
+        libs64.mkdir(parents=True, exist_ok=True)
+        src = bdir / manifest["so64"]
+        dst = libs64 / target_so
         shutil.copyfile(src, dst)
         dbg(f"installed {dst}")
 
@@ -498,6 +593,12 @@ def install_bridge(
             dst = syswow / target
             shutil.copyfile(src, dst)
             dbg(f"installed {dst}")
+            if "so32" in manifest:
+                libs32.mkdir(parents=True, exist_ok=True)
+                src = bdir / manifest["so32"]
+                dst = libs32 / target_so
+                shutil.copyfile(src, dst)
+                dbg(f"installed {dst}")
         else:
             warn(f"{syswow} missing; 32-bit DLL not installed "
                  "(64-bit-only prefix?)")
@@ -742,6 +843,7 @@ Environment:
     PROTON_ASIO_DEBUG        "1" to log every step to stderr
     PROTON_ASIO_FORCE_REINSTALL  "1" to ignore the marker and reinstall
     PROTON_ASIO_SHARE_DIR    override the share/proton-asio search path
+    PROTON_ASIO_PROTON_DIR   point at Proton manually when discovery fails
 
 Subcommands:
     proton-asio --uninstall [PREFIX]   remove all bridges from a prefix
@@ -826,6 +928,7 @@ def do_install(bridge: str, passthrough: list[str]) -> None:
         existing = read_marker(pfx)
         if existing == expected:
             dbg("marker matches; skipping install")
+            inject_wine_dll_path(pfx)
             warn_anti_cheat_if_debug()
             warn_audio_backend_if_debug(bridge)
             return
@@ -842,6 +945,9 @@ def do_install(bridge: str, passthrough: list[str]) -> None:
         except OSError as e:
             warn(f"could not write marker: {e}")
         log(f"{bridge} installed")
+    # Always inject WINEDLLPATH if we have something on disk — even a
+    # partial install needs the .so visible for the game to load it.
+    inject_wine_dll_path(pfx)
     warn_anti_cheat_if_debug()
     warn_audio_backend_if_debug(bridge)
 

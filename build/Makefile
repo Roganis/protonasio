@@ -141,9 +141,23 @@ tar.gz/$(WINEASIO_COMMIT)"; \
 	mkdir -p "$(WINEASIO_OUT)"; \
 	cp "$(WINEASIO_SRC)/build64/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll" 2>/dev/null \
 	    || cp "$(WINEASIO_SRC)/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll"; \
+	SO64=$$(find "$(WINEASIO_SRC)" \( -name 'wineasio64.dll.so' -o -name 'wineasio64.so' \) -type f -print -quit); \
+	if [[ -z "$$SO64" ]]; then \
+	    echo "[wineasio] ERROR: 64-bit .dll.so / .so not found in build" \
+	         "output. Wine fake-DLLs need both halves to load." >&2; \
+	    exit 1; \
+	fi; \
+	cp "$$SO64" "$(WINEASIO_OUT)/wineasio64.dll.so"; \
 	if [[ "$$HAS_32" == "1" ]]; then \
 	    cp "$(WINEASIO_SRC)/build32/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll" 2>/dev/null \
 	        || cp "$(WINEASIO_SRC)/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll"; \
+	    SO32=$$(find "$(WINEASIO_SRC)" \( -name 'wineasio32.dll.so' -o -name 'wineasio32.so' \) -type f -print -quit); \
+	    if [[ -z "$$SO32" ]]; then \
+	        echo "[wineasio] ERROR: 32-bit .dll.so / .so not found in build" \
+	             "output." >&2; \
+	        exit 1; \
+	    fi; \
+	    cp "$$SO32" "$(WINEASIO_OUT)/wineasio32.dll.so"; \
 	fi; \
 	echo "$$HAS_32" > "$(WINEASIO_OUT)/.has_32"
 	@echo "[wineasio] extracting CLSID from source..."
@@ -159,8 +173,13 @@ tar.gz/$(WINEASIO_COMMIT)"; \
 	{ \
 	    printf 'version=%s\n' "$(WINEASIO_REF)"; \
 	    printf 'target=wineasio.dll\n'; \
+	    printf 'target_so=wineasio.dll.so\n'; \
 	    printf 'dll64=wineasio64.dll\n'; \
-	    if [[ "$$HAS_32" == "1" ]]; then printf 'dll32=wineasio32.dll\n'; fi; \
+	    printf 'so64=wineasio64.dll.so\n'; \
+	    if [[ "$$HAS_32" == "1" ]]; then \
+	        printf 'dll32=wineasio32.dll\n'; \
+	        printf 'so32=wineasio32.dll.so\n'; \
+	    fi; \
 	    printf 'reg=wineasio.reg.template\n'; \
 	    printf 'uninstall_reg=wineasio-uninstall.reg\n'; \
 	} > "$(WINEASIO_OUT)/manifest.txt"
@@ -199,15 +218,25 @@ tar.gz/$(PWASIO_COMMIT)"; \
 	@echo "[pwasio] building (64-bit)..."
 	@cd "$(PWASIO_SRC)" && SOURCE_DATE_EPOCH=1700000000 $(MAKE)
 	@mkdir -p "$(PWASIO_OUT)"
-	@# Upstream produces lib/wine/x86_64-windows/pwasio.dll. Locate it
-	@# robustly across release layouts.
-	@DLL=$$(find "$(PWASIO_SRC)" -name pwasio.dll -path '*x86_64-windows*' \
-	    -o -name pwasio.dll | head -1); \
+	@# Upstream produces lib/wine/x86_64-windows/pwasio.dll (PE) and
+	@# lib/wine/x86_64-unix/pwasio.dll.so (ELF). Both are needed: Wine's
+	@# load_builtin path only resolves the fake-DLL when the matching
+	@# .dll.so is on WINEDLLPATH at load time.
+	@DLL=$$(find "$(PWASIO_SRC)" \( -path '*x86_64-windows*/pwasio.dll' \
+	    -o -name pwasio.dll \) -type f -print -quit); \
 	    if [[ -z "$$DLL" ]]; then \
 	        echo "pwasio.dll not produced — check upstream Makefile" >&2; \
 	        exit 1; \
 	    fi; \
 	    cp "$$DLL" "$(PWASIO_OUT)/pwasio64.dll"
+	@SO=$$(find "$(PWASIO_SRC)" \( -path '*x86_64-unix*/pwasio.dll.so' \
+	    -o -name 'pwasio.dll.so' -o -name 'pwasio.so' \) -type f -print -quit); \
+	    if [[ -z "$$SO" ]]; then \
+	        echo "pwasio.dll.so not produced — Wine fake-DLLs need" \
+	             "both halves to load" >&2; \
+	        exit 1; \
+	    fi; \
+	    cp "$$SO" "$(PWASIO_OUT)/pwasio64.dll.so"
 	@# pwasio handles its own COM registration via DllRegisterServer
 	@# (which writes more than just CLSID + InprocServer32: it also adds
 	@# the HKLM driver-list entry and any other state pwasio decides it
@@ -223,8 +252,10 @@ tar.gz/$(PWASIO_COMMIT)"; \
 	    printf 'version=%s+%s\n' \
 	        "$(PWASIO_REF)" "$$(echo $(PWASIO_COMMIT) | cut -c1-12)"; \
 	    printf 'target=pwasio.dll\n'; \
+	    printf 'target_so=pwasio.dll.so\n'; \
 	    printf 'install_method=regsvr32\n'; \
 	    printf 'dll64=pwasio64.dll\n'; \
+	    printf 'so64=pwasio64.dll.so\n'; \
 	    printf 'config_reg=pwasio-config.reg.template\n'; \
 	    printf 'config_uninstall_reg=pwasio-config-uninstall.reg\n'; \
 	} > "$(PWASIO_OUT)/manifest.txt"

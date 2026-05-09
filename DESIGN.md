@@ -225,6 +225,42 @@ Sweep order matters for `regsvr32` bridges: `regsvr32 /u` must run
 in-process from the DLL itself. The wrapper's
 `uninstall_one_bridge()` enforces this order.
 
+### .dll.so deployment and WINEDLLPATH
+
+Both wineasio and pwasio are Wine **fake DLLs**: each ships as a PE stub
+(`<bridge>.dll`) **plus** a matching ELF library (`<bridge>.dll.so`)
+that contains the actual code. Wine's `load_builtin` resolves the
+fake-DLL by dlopen'ing the .dll.so from `WINEDLLPATH`; with only the PE
+stub installed, Wine returns `c0000135` / `DLL_NOT_FOUND` and
+registration / loading both fail.
+
+We deploy both halves prefix-locally — Proton's tree is read-only
+across updates and may live under `/usr/share` (root-owned), so
+touching it is a non-starter:
+
+```
+<pfx>/drive_c/windows/system32/<target>          # PE 64-bit fake-DLL
+<pfx>/drive_c/windows/syswow64/<target>          # PE 32-bit fake-DLL (when present)
+<pfx>/proton-asio-libs/x86_64-unix/<target_so>   # ELF 64-bit
+<pfx>/proton-asio-libs/i386-unix/<target_so>     # ELF 32-bit (when present)
+```
+
+The ELF half lives outside `system32` so we don't mix file types Wine
+expects to be PE-only. The arch-split mirrors Wine's own
+`<wineroot>/lib/wine/<arch>-unix/` convention so the same `target_so`
+filename can carry both bitnesses without collision.
+
+`WINEDLLPATH` is injected by the wrapper into `os.environ` immediately
+before `execvp(passthrough)` — the modified env propagates to Proton
+and from there to the game's Wine. We also set it on the Wine
+subprocesses we run at install time (`regedit /S`, `regsvr32`) so
+pwasio's `DllRegisterServer` can resolve the .so on the very same
+install pass.
+
+Marker hash covers `dll64`, `dll32`, `so64`, `so32` — touching any of
+the four artefacts in `share/proton-asio/<bridge>/` invalidates the
+marker and triggers reinstall.
+
 ## Layout
 
 ```

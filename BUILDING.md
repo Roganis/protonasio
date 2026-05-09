@@ -8,9 +8,32 @@ release tarball (which already contains pre-built bridge DLLs in
 
 The wrapper itself (`proton-asio`) is a single Python 3 file with no
 dependencies and no build step. The work is in producing the **bridge
-DLLs** (`wineasio32.dll`, `wineasio64.dll`, `pwasio64.dll`) and rendering
-their registry templates from the upstream sources pinned in
-`build/BRIDGES.lock`.
+fake-DLLs** and rendering their registry templates from the upstream
+sources pinned in `build/BRIDGES.lock`.
+
+Each Wine bridge ships as **two files per bitness**: a PE stub
+(`<bridge>.dll`) and the matching ELF library (`<bridge>.dll.so`).
+Wine's `load_builtin` resolves the PE stub by dlopen'ing the .dll.so
+from `WINEDLLPATH` — if either half is missing the bridge fails to
+load with `c0000135 / DLL_NOT_FOUND`. The build extracts both halves
+out of each bridge's source tree and lays them out under
+`share/proton-asio/<bridge>/`:
+
+```
+share/proton-asio/wineasio/
+    wineasio64.dll        wineasio64.dll.so
+    wineasio32.dll        wineasio32.dll.so   (if built — see WoW64 below)
+    wineasio.reg.template wineasio-uninstall.reg manifest.txt
+share/proton-asio/pwasio/
+    pwasio64.dll          pwasio64.dll.so
+    pwasio-config.reg.template pwasio-config-uninstall.reg manifest.txt
+```
+
+The wrapper deploys the PE halves into the prefix's `system32` /
+`syswow64` and the ELF halves into a prefix-local
+`proton-asio-libs/<arch>-unix/` tree at install time, then injects
+`WINEDLLPATH` at launch so Wine finds the .dll.so without us touching
+the (often root-owned and update-clobbered) Proton tree.
 
 ## Toolchain
 

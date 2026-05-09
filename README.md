@@ -170,6 +170,18 @@ findable. Re-launch with `PROTON_ASIO_DEBUG=1` for verbose tracing.
    both. If you forced `PROTON_ASIO_BRIDGE=pwasio` on a 32-bit game, switch
    back to `wineasio`.
 
+**Wine logs `load_builtin "wineasio.dll" is a fake Wine dll` then
+`find_builtin_dll cannot find builtin library` / `status=c0000135`.**
+This means the PE stub was installed but Wine couldn't find the
+matching `.dll.so`. proton-asio injects `WINEDLLPATH` pointing at
+`<pfx>/proton-asio-libs/{x86_64,i386}-unix/` automatically; if you see
+this error, check that those directories actually contain `.dll.so`
+files (`PROTON_ASIO_FORCE_REINSTALL=1` will re-deploy them) and that
+nothing in your launch option pipeline is clobbering `WINEDLLPATH`
+before Proton runs. You can confirm what's reaching the game with
+`PROTON_ASIO_DEBUG=1` — look for the `WINEDLLPATH=…` line in the
+Steam stdout log.
+
 **xruns / dropouts.** Increase `PROTON_ASIO_BUFFER` (try 512, then 1024).
 The default 256 is fine on a tuned PipeWire setup but borderline on stock
 configurations. Also check `pw-top` for clients that are running at
@@ -255,13 +267,22 @@ underneath it.
 ## Files
 
 ```
-~/.local/bin/proton-asio                            # the wrapper
-~/.local/share/proton-asio/wineasio/...             # bridge DLLs + .reg
+~/.local/bin/proton-asio                                     # the wrapper
+~/.local/share/proton-asio/wineasio/...                      # bridge DLLs + .so + .reg
 ~/.local/share/proton-asio/pwasio/...
-<prefix>/.proton_asio_installed                     # per-prefix marker
-<prefix>/drive_c/windows/system32/wineasio.dll      # 64-bit DLL
-<prefix>/drive_c/windows/syswow64/wineasio.dll      # 32-bit DLL
+<prefix>/.proton_asio_installed                              # per-prefix marker
+<prefix>/drive_c/windows/system32/wineasio.dll               # PE 64-bit fake-DLL
+<prefix>/drive_c/windows/syswow64/wineasio.dll               # PE 32-bit fake-DLL
+<prefix>/proton-asio-libs/x86_64-unix/wineasio.dll.so        # ELF 64-bit (the real code)
+<prefix>/proton-asio-libs/i386-unix/wineasio.dll.so          # ELF 32-bit
 ```
+
+Wine fake-DLLs are two files: the PE `.dll` is a stub Wine matches
+against the Windows-side import; the matching `.dll.so` is the ELF
+library that runs on the Linux side. Both must be reachable, and we
+inject `WINEDLLPATH=<pfx>/proton-asio-libs/{x86_64,i386}-unix` at
+launch so the loader finds the .so without us having to touch the
+read-only Proton tree.
 
 ## License
 
