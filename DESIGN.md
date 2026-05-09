@@ -64,32 +64,51 @@ without ASIO — never abort.
 
 ### Wine binary discovery
 
-Primary path: **`STEAM_COMPAT_TOOL_PATHS`**. This is a colon-separated list of
-the compat-tool directories Steam has bind-mounted into the game's environment
-(documented in steam-runtime-tools' `steam-compat-tool-interface.md` as
-"a colon-delimited list of paths to Steam compatibility tools in use, such as
-Proton and the Steam Linux Runtime"). Iterate the entries; pick the first
-whose directory contains both a `proton` script (executable) AND a
-`files/bin/wine64` (or `dist/bin/wine64` for legacy GE). That entry is the
-Proton dir. The Steam Linux Runtime entries are skipped naturally because
-they have neither.
+Three sources in priority order, all funnelled through one
+`discover_proton()` that returns `(proton_dir, wine64_path)` or a
+detailed rejection summary.
 
-Fallback path (when `STEAM_COMPAT_TOOL_PATHS` is unset, malformed, or contains
-no entry that looks like Proton): scan argv left-to-right and pick the first
-arg whose basename is exactly `proton` AND whose immediate next arg is one of
-the known Proton verbs (`run`, `runinprefix`, `waitforexitandrun`,
-`getcompatpath`, `getnativepath`). Take its directory.
+1. **`PROTON_ASIO_PROTON_DIR`** (escape hatch). Highest priority. The
+   user points at the directory that contains the `proton` script and
+   we trust it. Documented for custom Proton builds and SLR variants
+   whose layout we don't know.
 
-Either way, resolve Wine binaries against the resulting `PROTON_DIR` in this
-order, taking the first that exists:
+2. **`STEAM_COMPAT_TOOL_PATHS`** (primary). Colon-delimited list set
+   by Steam Linux Runtime / pressure-vessel; documented in
+   steam-runtime-tools' `steam-compat-tool-interface.md` as "a
+   colon-delimited list of paths to Steam compatibility tools in use,
+   such as Proton and the Steam Linux Runtime." We iterate **every**
+   entry — SLR variants list both the runtime container path and the
+   real Proton path, and the order isn't guaranteed.
 
-- `$PROTON_DIR/files/bin/wine64` and `…/wine` (modern Proton, Proton-GE,
-  Proton-CachyOS).
-- `$PROTON_DIR/dist/bin/wine64` and `…/wine` (legacy GE builds).
+3. **argv scan** (fallback). Walks the trailing argv for any path
+   whose basename is `proton` followed by a known verb (`run`,
+   `runinprefix`, `waitforexitandrun`, `getcompatpath`,
+   `getnativepath`). This handles the SLR-wrapped invocation shape
+   where Proton is four levels deep behind `steam-launch-wrapper`,
+   Steam's `reaper`, and the SLR `_v2-entry-point`, with several
+   `--` separators in the way:
 
-If neither pair exists, log a `[proton-asio]` error and `exec` the original
-argv unchanged. We never substitute a system Wine — prefix Wine version must
-match Proton's.
+   ```
+   /…/steam-launch-wrapper -- /…/reaper SteamLaunch AppId=N --
+   /…/SteamLinuxRuntime_4/_v2-entry-point --verb=waitforexitandrun --
+   /…/proton-cachyos-slr/proton waitforexitandrun /…/game.exe
+   ```
+
+   Multiple `--` separators don't matter because the scan keys off the
+   `proton` basename + verb pairing.
+
+For each candidate dir, `find_wine64_in()` probes a list of known
+relative paths first (`files/bin/wine64`, `dist/bin/wine64`,
+`proton/files/bin/wine64`, `proton_dist/files/bin/wine64`) and falls
+back to `glob("**/wine64")` skipping anything inside a Wine-prefix
+drive layout (`drive_c`, `users`, `Program Files`, etc.). The first
+candidate that yields an executable `wine64` wins.
+
+If nothing matches, we emit one user-visible warn line and one debug
+line per rejected candidate explaining why each was skipped, then
+`exec` the original argv unchanged. We never substitute a system
+Wine — the prefix's Wine version must match Proton's.
 
 The prefix path comes from `STEAM_COMPAT_DATA_PATH/pfx`, with a sanity check
 that the directory exists; if it doesn't, we skip setup, exec Proton (which

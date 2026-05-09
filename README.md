@@ -112,6 +112,7 @@ PROTON_ASIO=1 PROTON_ASIO_BRIDGE=pwasio PROTON_ASIO_BUFFER=128 proton-asio %comm
 | `PROTON_ASIO_DEBUG` | unset | `1` to log every step to stderr (look for `[proton-asio]` in Steam's stdout). |
 | `PROTON_ASIO_FORCE_REINSTALL` | unset | `1` to ignore the marker and reinstall on next launch. |
 | `PROTON_ASIO_SHARE_DIR` | unset | Override the bridge-files search path. |
+| `PROTON_ASIO_PROTON_DIR` | unset | Escape hatch when discovery fails (custom builds, weird launchers). Set to the directory containing the `proton` script — proton-asio will trust this and locate `wine64` underneath it. Skips both the `STEAM_COMPAT_TOOL_PATHS` and argv-scan paths. |
 
 To remove ASIO from a game, just delete the launch option. The DLLs and
 registry entries stay dormant in the prefix until something asks for ASIO.
@@ -226,6 +227,30 @@ then relaunch the game.
 Proton, Proton creates the prefix mid-launch. proton-asio detects this and
 defers — it logs a warning and execs Proton normally. The *second* launch
 sees the populated prefix and installs the bridge.
+
+**`could not locate Proton; tried N candidate(s)`.** Discovery walks
+three sources in priority order: `PROTON_ASIO_PROTON_DIR` →
+`STEAM_COMPAT_TOOL_PATHS` (every entry — SLR variants list the
+runtime container alongside the real Proton) → an argv scan that
+walks past `steam-launch-wrapper`, Steam's `reaper`, and SLR's
+`_v2-entry-point` looking for the real `proton` invocation. Each
+candidate has to be a directory containing an executable `wine64` at
+`files/bin/`, `dist/bin/`, or some other path the glob fallback can
+find without descending into a Wine prefix.
+
+Run with `PROTON_ASIO_DEBUG=1` and you'll get one rejection line per
+candidate explaining why it was rejected. If discovery still fails on
+a custom Proton build (Proton-CachyOS-SLR, Wine-staging packaged in an
+unusual layout, an Asahi-style nested runtime, …), bypass it
+explicitly:
+
+```
+PROTON_ASIO=1 PROTON_ASIO_PROTON_DIR=/path/to/proton-dir proton-asio %command%
+```
+
+`/path/to/proton-dir` is the directory that contains the `proton`
+script. proton-asio will trust the override and look for `wine64`
+underneath it.
 
 ## Files
 

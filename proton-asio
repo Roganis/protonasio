@@ -61,49 +61,124 @@ def err(msg: str) -> None:
 # Discovery
 # ---------------------------------------------------------------------------
 
-def _proton_dir_looks_real(p: Path) -> bool:
-    if not (p / "proton").is_file():
-        return False
-    return (
-        (p / "files/bin/wine64").exists()
-        or (p / "dist/bin/wine64").exists()
-    )
+# Known relative paths to a usable wine64 binary inside a Proton tree.
+# Probed in order; first hit wins. Layouts seen in the wild:
+#   - Valve Proton, Proton-GE, Proton-CachyOS:   files/bin/wine64
+#   - Legacy GE / older custom Protons:          dist/bin/wine64
+# Add more entries here when distros nest the runtime differently.
+WINE64_PROBE_PATHS: tuple[str, ...] = (
+    "files/bin/wine64",
+    "dist/bin/wine64",
+    "proton/files/bin/wine64",
+    "proton_dist/files/bin/wine64",
+)
+
+# Top-level directory names we should never descend into when looking for
+# a host-side wine64 — these are inside Wine prefixes / runtime guest
+# layouts and don't contain the host runner.
+WINE_GLOB_SKIP = frozenset({
+    "drive_c", "users", "Program Files", "Program Files (x86)",
+    "ProgramData", "windows",
+})
 
 
-def find_proton_dir(argv: list[str]) -> Path | None:
-    """Locate the active Proton install dir.
+def find_wine64_in(proton_dir: Path) -> Path | None:
+    """Locate an executable wine64 binary under proton_dir. Tries the
+    documented layouts first, then falls back to a glob for any
+    executable named `wine64` that isn't inside a Wine prefix's drive
+    layout. Returns None if nothing matches."""
+    for rel in WINE64_PROBE_PATHS:
+        p = proton_dir / rel
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+    try:
+        for p in proton_dir.glob("**/wine64"):
+            if not p.is_file() or not os.access(p, os.X_OK):
+                continue
+            rel_parts = p.relative_to(proton_dir).parts
+            if any(part in WINE_GLOB_SKIP for part in rel_parts):
+                continue
+            return p
+    except OSError:
+        pass
+    return None
 
-    Primary: STEAM_COMPAT_TOOL_PATHS (colon-delimited list of compat-tool
-    paths bind-mounted by Steam's runtime). Fallback: argv scan for a
-    `proton` script followed by a known verb.
+
+def discover_proton(argv: list[str]) -> tuple[Path, Path] | None:
+    """Find the active Proton dir + a usable wine64.
+
+    Sources tried in priority order:
+
+    1. ``PROTON_ASIO_PROTON_DIR`` — explicit override. Documented as
+       the escape hatch when discovery fails (custom Proton builds,
+       SLR variants whose layout we don't know, weird launchers).
+    2. ``STEAM_COMPAT_TOOL_PATHS`` — colon-delimited list set by Steam
+       Linux Runtime / pressure-vessel. Iterates **every** entry
+       because SLR variants list both the runtime container path and
+       the real Proton path; the order isn't guaranteed and the first
+       entry isn't always the runnable one.
+    3. argv scan — walks the trailing argv for a path whose basename
+       is ``proton`` followed by a known Proton verb. Handles the
+       SLR-wrapped invocation shape:
+       ``steam-launch-wrapper -- reaper SteamLaunch AppId=N --
+       _v2-entry-point --verb=waitforexitandrun --
+       /…/proton-cachyos-slr/proton waitforexitandrun /…/game.exe``
+       — there are several ``--`` separators before the real Proton
+       invocation; the scan ignores them and keys off the verb.
+
+    Under PROTON_ASIO_DEBUG=1 every rejected candidate is logged with
+    a reason, so users can see exactly what went wrong.
     """
+    candidates: list[tuple[str, Path]] = []
+
+    override = os.environ.get("PROTON_ASIO_PROTON_DIR")
+    if override:
+        candidates.append(("PROTON_ASIO_PROTON_DIR", Path(override)))
+
     paths_env = os.environ.get("STEAM_COMPAT_TOOL_PATHS", "")
     for entry in paths_env.split(":"):
-        if not entry:
-            continue
-        p = Path(entry)
-        if _proton_dir_looks_real(p):
-            dbg(f"proton dir via STEAM_COMPAT_TOOL_PATHS: {p}")
-            return p
+        if entry:
+            candidates.append(("STEAM_COMPAT_TOOL_PATHS", Path(entry)))
 
     for i in range(len(argv) - 1):
         a = argv[i]
         if Path(a).name == "proton" and argv[i + 1] in PROTON_VERBS:
-            d = Path(a).resolve().parent
-            if _proton_dir_looks_real(d):
-                dbg(f"proton dir via argv scan: {d}")
-                return d
+            try:
+                d = Path(a).resolve().parent
+            except OSError:
+                continue
+            candidates.append(("argv-scan", d))
 
+    rejected: list[tuple[str, Path, str]] = []
+    seen: set[Path] = set()
+    for source, p in candidates:
+        try:
+            real = p.resolve()
+        except OSError as e:
+            rejected.append((source, p, f"could not resolve: {e}"))
+            continue
+        if real in seen:
+            continue
+        seen.add(real)
+        if not real.is_dir():
+            rejected.append((source, p, f"{real} is not a directory"))
+            continue
+        wine = find_wine64_in(real)
+        if wine:
+            dbg(f"proton dir via {source}: {real} (wine64: {wine})")
+            return real, wine
+        rejected.append((source, p, "no wine64 under known layouts or glob"))
+
+    if rejected:
+        # Log every rejection so a user reporting a discovery failure
+        # can see what we tried. Always under DEBUG; one summary line
+        # always so the failure is at least findable.
+        warn(f"could not locate Proton; tried {len(rejected)} candidate(s). "
+             f"Set PROTON_ASIO_DEBUG=1 to see why each was rejected, or "
+             f"set PROTON_ASIO_PROTON_DIR to point at the install.")
+        for source, p, reason in rejected:
+            dbg(f"  rejected ({source}): {p}: {reason}")
     return None
-
-
-def find_wine_binaries(proton_dir: Path) -> tuple[Path | None, Path | None]:
-    for sub in ("files/bin", "dist/bin"):
-        w64 = proton_dir / sub / "wine64"
-        if w64.exists():
-            w32 = proton_dir / sub / "wine"
-            return w64, (w32 if w32.exists() else None)
-    return None, None
 
 
 def share_dir_candidates() -> list[Path]:
@@ -588,22 +663,16 @@ def uninstall_subcommand(prefix: str | None) -> int:
         err("--uninstall requires a prefix path or STEAM_COMPAT_DATA_PATH")
         return 2
 
-    # We need a Wine binary; without a Proton dir from argv/env, look for
-    # files/bin/wine64 alongside the prefix's parent (Proton-style layouts
-    # don't keep wine in pfx, so this is best-effort).
-    wine64 = None
-    paths_env = os.environ.get("STEAM_COMPAT_TOOL_PATHS", "")
-    for entry in paths_env.split(":"):
-        if entry:
-            p = Path(entry)
-            if _proton_dir_looks_real(p):
-                wine64, _ = find_wine_binaries(p)
-                if wine64:
-                    break
-    if not wine64:
-        err("could not locate a Wine binary; run --uninstall with "
-            "STEAM_COMPAT_TOOL_PATHS pointing at the active Proton")
+    # We need a Wine binary; defer to the same discovery pipeline used
+    # at launch time. argv has no proton invocation in --uninstall mode
+    # so this falls back to PROTON_ASIO_PROTON_DIR / STEAM_COMPAT_TOOL_PATHS.
+    found = discover_proton(argv=[])
+    if not found:
+        err("could not locate a Wine binary; rerun --uninstall with "
+            "PROTON_ASIO_PROTON_DIR=/path/to/proton or with "
+            "STEAM_COMPAT_TOOL_PATHS set")
         return 3
+    _, wine64 = found
 
     for bridge in KNOWN_BRIDGES:
         uninstall_one_bridge(bridge, pfx, wine64)
@@ -745,15 +814,12 @@ def do_install(bridge: str, passthrough: list[str]) -> None:
              "ASIO will be installed on the next launch.")
         return
 
-    proton_dir = find_proton_dir(passthrough)
-    if not proton_dir:
-        warn("could not locate Proton dir from STEAM_COMPAT_TOOL_PATHS or argv; "
-             "launching without ASIO")
+    found = discover_proton(passthrough)
+    if not found:
+        # discover_proton already emitted the per-candidate rejections.
+        warn("launching without ASIO")
         return
-    wine64, _ = find_wine_binaries(proton_dir)
-    if not wine64:
-        warn(f"no wine64 under {proton_dir}; launching without ASIO")
-        return
+    proton_dir, wine64 = found
 
     expected = expected_marker(bridge, manifest, dll_paths)
     if os.environ.get("PROTON_ASIO_FORCE_REINSTALL") != "1":
