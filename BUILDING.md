@@ -20,11 +20,64 @@ You need:
   Both bridges are Wine DLLs (PE-wrapped ELF), not regular Win32 DLLs, so
   you cannot build them with mingw-w64 alone.
 - **Multilib support** so that 32-bit DLLs can be cross-compiled on a
-  64-bit host. Most distros gate this behind extra packages.
+  64-bit host. **Most distros gate this behind extra packages, AND most
+  rolling distros have already moved their default Wine package to
+  WoW64 mode where 32-bit Wine libraries don't exist at all.** See
+  [32-bit support and WoW64](#32-bit-support-and-wow64) below.
 - **mingw-w64** as a fallback / completeness toolchain (some bridge
   Makefiles call it directly).
 - **Python 3.9+** to drive the build scripts.
 - `curl`, `tar`, `sha256sum`, GNU `make`.
+
+## 32-bit support and WoW64
+
+Mainline Wine has been transitioning from a "true multilib" build (separate
+32-bit and 64-bit Wine builds, with both copies of every Wine library on
+disk) to a **WoW64-only** build (a single 64-bit Wine that runs 32-bit
+Windows programs through a Wow64 thunk layer, with no 32-bit Wine libraries
+on the host). This is the upstream direction, not a distro quirk:
+
+- Arch's `wine` 11.x (current) ships **WoW64-only**.
+  `/usr/lib/wine/i386-unix/` does not exist.
+- Fedora rolling and openSUSE Tumbleweed are following the same path.
+- Debian stable, Ubuntu LTS, and Wine-Staging branches typically still
+  ship the legacy multilib build with `/usr/lib/wine/i386-unix/` populated.
+
+What this means in practice for proton-asio's build:
+
+- **64-bit wineasio always builds.** This covers ~all 64-bit Windows games.
+- **32-bit wineasio requires legacy non-WoW64 Wine on the build host.**
+  Without `/usr/lib/wine/i386-unix/` present, `winegcc -m32` cannot find
+  `winecrt0.o` and friends, and no amount of mingw-w64 will substitute
+  for the missing Wine arch-libs.
+
+`make build` probes `/usr/lib/wine/i386-unix/` (or wherever
+`WINE_LIB_DIR` points) before building 32-bit. If the directory is
+missing it skips the 32-bit step with a clear warning rather than failing
+the whole build. The output `share/proton-asio/wineasio/manifest.txt`
+reflects what was actually produced — `dll32=` is omitted on
+WoW64-only hosts — and the runtime wrapper warns clearly when a
+WoW64-capable prefix has only the 64-bit DLL installed.
+
+If you need 32-bit support, your options are:
+
+1. **Build in a Debian / Ubuntu chroot or container** where the older
+   multilib `wine` and `wine32-tools` packages are still available.
+   `debootstrap` a `bookworm` rootfs, install `wine wine32` per the
+   Debian instructions below, run `make build` inside.
+2. **Use a Wine-Staging build** that explicitly retains the legacy
+   multilib layout. (Check that `/usr/lib/wine/i386-unix/` exists before
+   trusting the package name.)
+3. **Skip 32-bit support.** For most current titles this is fine — the
+   long tail of 32-bit-only games that benefit from ASIO is small, and
+   pwasio is 64-bit-only by design anyway.
+
+Override the probed location with `WINE_LIB_DIR`, e.g. for a non-standard
+install:
+
+```sh
+make -C build build-wineasio WINE_LIB_DIR=/opt/wine-stable/lib/wine
+```
 
 ### Debian / Ubuntu
 
@@ -63,6 +116,11 @@ sudo pacman -S --needed \
     mingw-w64-gcc \
     python curl
 ```
+
+Note: Arch's `wine` package is **WoW64-only** as of Wine 11.x.
+`/usr/lib/wine/i386-unix/` will not exist, so `make build` will skip the
+32-bit wineasio target with a warning. This is fine for 64-bit games (the
+common case). See [32-bit support and WoW64](#32-bit-support-and-wow64).
 
 ## Build steps
 
@@ -168,15 +226,24 @@ marker), and a `PROTON_ASIO_FORCE_REINSTALL=1` run.
 
 ## Known build wrinkles
 
-- **No 32-bit pwasio.** Upstream's Makefile ships only a 64-bit target.
-  The build records this in the manifest as a missing `dll32` field, and
-  proton-asio refuses to install pwasio into syswow64 with a clear
-  warning. If upstream adds a 32-bit target, drop a matching `dll32`
-  entry into the manifest written by `build-pwasio` in `build/Makefile`.
+- **WoW64-only Wine hosts skip 32-bit wineasio.** See
+  [32-bit support and WoW64](#32-bit-support-and-wow64). The build emits
+  a warning, the manifest omits `dll32`, and the wrapper warns at install
+  time if the target prefix could host 32-bit games.
+- **No 32-bit pwasio at all.** Upstream's Makefile ships only a 64-bit
+  target by design. If upstream adds a 32-bit target, drop a matching
+  `dll32` entry into the manifest written by `build-pwasio` in
+  `build/Makefile`.
+- **`LIBRARY_PATH` for 64-bit wineasio.** The upstream Makefile's
+  hard-coded `-L` paths don't include `/usr/lib/wine/x86_64-unix/`,
+  which is where modern Wine actually keeps `winecrt0.o`. Our build sets
+  `LIBRARY_PATH=$(WINE_LIB_DIR)/x86_64-unix` automatically; if you build
+  by hand without our Makefile and get "cannot find -lwinecrt0" or
+  similar, that's the fix.
 - **wineasio output filename.** Recent Wine versions want `.so` instead
   of `.dll.so`; the Makefile already tolerates both by `cp`ing the file
   with the canonical `.dll` suffix into `share/proton-asio/wineasio/`.
 - **Wine version skew.** Bridges built against Wine N may fail to load in
   a Proton prefix using a *much* older or newer Wine N±many. In practice
-  building against any Wine 8.x or 9.x is fine for current Proton; CI
+  building against any Wine 8.x – 11.x is fine for current Proton; CI
   uses the Wine in Debian 12.

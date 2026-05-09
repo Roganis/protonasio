@@ -27,6 +27,15 @@ GEN_REG     := python3 $(BUILD_DIR)/gen-reg.py
 EXTRACT     := python3 $(BUILD_DIR)/extract-clsid.py
 LOCK_SCRIPT := python3 $(BUILD_DIR)/lock.py
 
+# Wine library directory. Modern Wine (10.x+) splits libraries by host
+# arch under <prefix>/lib/wine/{x86_64,i386}-unix/. WoW64-only Wine
+# installs (Arch's wine 11.x, Fedora rolling, etc.) ship only the
+# x86_64-unix tree — the i386-unix dir is missing entirely, and 32-bit
+# Wine PE/ELF DLLs cannot be built. We probe per-arch below.
+WINE_LIB_DIR ?= /usr/lib/wine
+WINE64_UNIX_DIR := $(WINE_LIB_DIR)/x86_64-unix
+WINE32_UNIX_DIR := $(WINE_LIB_DIR)/i386-unix
+
 # Deterministic output: SOURCE_DATE_EPOCH is set per-bridge from the upstream
 # commit's author date inside the per-bridge target.
 export LC_ALL := C
@@ -97,19 +106,46 @@ tar.gz/$(WINEASIO_COMMIT)"; \
 	@tar -xzf "$(WINEASIO_TAR)" -C "$(WINEASIO_SRC).extract"
 	@mv "$(WINEASIO_SRC).extract"/wineasio-* "$(WINEASIO_SRC)"
 	@rmdir "$(WINEASIO_SRC).extract"
-	@echo "[wineasio] cross-compiling 32-bit and 64-bit..."
+	@# 64-bit build. LIBRARY_PATH must point at the host's Wine arch-lib
+	@# dir; modern Wine doesn't ship symlinks at /usr/lib that the bridge's
+	@# upstream Makefile expects, so without this winegcc fails to find
+	@# winecrt0.o et al. on Arch / Fedora-rolling.
+	@if [[ ! -d "$(WINE64_UNIX_DIR)" ]]; then \
+	    echo "[wineasio] WARN: $(WINE64_UNIX_DIR) not found — install" \
+	         "wine-devel and re-run, or set WINE_LIB_DIR=…" >&2; \
+	    exit 1; \
+	fi
+	@echo "[wineasio] building 64-bit (LIBRARY_PATH=$(WINE64_UNIX_DIR))..."
 	@cd "$(WINEASIO_SRC)" && \
 	    SOURCE_DATE_EPOCH=$$(git -C "$(WINEASIO_SRC)" log -1 --format=%ct 2>/dev/null \
 	        || echo 1700000000) \
-	    $(MAKE) 64 && \
-	    SOURCE_DATE_EPOCH=$$(git -C "$(WINEASIO_SRC)" log -1 --format=%ct 2>/dev/null \
-	        || echo 1700000000) \
-	    $(MAKE) 32
-	@mkdir -p "$(WINEASIO_OUT)"
-	@cp "$(WINEASIO_SRC)/build64/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll" \
-	    || cp "$(WINEASIO_SRC)/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll"
-	@cp "$(WINEASIO_SRC)/build32/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll" \
-	    || cp "$(WINEASIO_SRC)/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll"
+	    LIBRARY_PATH="$(WINE64_UNIX_DIR)$${LIBRARY_PATH:+:$$LIBRARY_PATH}" \
+	    $(MAKE) 64
+	@# 32-bit build. Skip cleanly on WoW64-only Wine installs.
+	@if [[ -d "$(WINE32_UNIX_DIR)" ]]; then \
+	    echo "[wineasio] building 32-bit (LIBRARY_PATH=$(WINE32_UNIX_DIR))..."; \
+	    cd "$(WINEASIO_SRC)" && \
+	        SOURCE_DATE_EPOCH=$$(git -C "$(WINEASIO_SRC)" log -1 --format=%ct 2>/dev/null \
+	            || echo 1700000000) \
+	        LIBRARY_PATH="$(WINE32_UNIX_DIR)$${LIBRARY_PATH:+:$$LIBRARY_PATH}" \
+	        $(MAKE) 32; \
+	    HAS_32=1; \
+	else \
+	    echo "[wineasio] WARN: $(WINE32_UNIX_DIR) is missing — host Wine" \
+	         "is WoW64-only. Skipping 32-bit build. 32-bit Windows games" \
+	         "in any prefix using this build will not see ASIO."; \
+	    echo "[wineasio]       To get 32-bit support you need legacy" \
+	         "(non-WoW64) Wine: see BUILDING.md."; \
+	    HAS_32=0; \
+	fi; \
+	mkdir -p "$(WINEASIO_OUT)"; \
+	cp "$(WINEASIO_SRC)/build64/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll" 2>/dev/null \
+	    || cp "$(WINEASIO_SRC)/wineasio64.dll" "$(WINEASIO_OUT)/wineasio64.dll"; \
+	if [[ "$$HAS_32" == "1" ]]; then \
+	    cp "$(WINEASIO_SRC)/build32/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll" 2>/dev/null \
+	        || cp "$(WINEASIO_SRC)/wineasio32.dll" "$(WINEASIO_OUT)/wineasio32.dll"; \
+	fi; \
+	echo "$$HAS_32" > "$(WINEASIO_OUT)/.has_32"
 	@echo "[wineasio] extracting CLSID from source..."
 	@CLSID=$$($(EXTRACT) "$(WINEASIO_SRC)" CLSID_WineASIO); \
 	    echo "[wineasio] CLSID = $$CLSID"; \
@@ -119,8 +155,16 @@ tar.gz/$(WINEASIO_COMMIT)"; \
 	    $(GEN_REG) --clsid "$$CLSID" \
 	        --in "$(TEMPLATES)/wineasio-uninstall.reg.in" \
 	        --out "$(WINEASIO_OUT)/wineasio-uninstall.reg"
-	@printf 'version=%s\ntarget=wineasio.dll\ndll64=wineasio64.dll\ndll32=wineasio32.dll\nreg=wineasio.reg.template\nuninstall_reg=wineasio-uninstall.reg\n' \
-	    "$(WINEASIO_REF)" > "$(WINEASIO_OUT)/manifest.txt"
+	@HAS_32=$$(cat "$(WINEASIO_OUT)/.has_32"); \
+	{ \
+	    printf 'version=%s\n' "$(WINEASIO_REF)"; \
+	    printf 'target=wineasio.dll\n'; \
+	    printf 'dll64=wineasio64.dll\n'; \
+	    if [[ "$$HAS_32" == "1" ]]; then printf 'dll32=wineasio32.dll\n'; fi; \
+	    printf 'reg=wineasio.reg.template\n'; \
+	    printf 'uninstall_reg=wineasio-uninstall.reg\n'; \
+	} > "$(WINEASIO_OUT)/manifest.txt"
+	@rm -f "$(WINEASIO_OUT)/.has_32"
 	@echo "[wineasio] -> $(WINEASIO_OUT)"
 
 # ---------------------------------------------------------------------------

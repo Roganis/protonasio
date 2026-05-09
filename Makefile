@@ -9,6 +9,9 @@
 #
 # Defaults: PREFIX=$(HOME)/.local. Override with `make install PREFIX=/usr`.
 
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
 PREFIX  ?= $(HOME)/.local
 DESTDIR ?=
 BINDIR  := $(PREFIX)/bin
@@ -38,10 +41,29 @@ build:
 	$(MAKE) -C build build
 
 install:
+	@# Refuse to install if the build hasn't actually produced anything.
+	@# An empty share/proton-asio/ would silently install just the
+	@# wrapper, which would then refuse every launch with "bridge files
+	@# not found" — much better to fail here.
 	@if [[ ! -d "$(SHARE_SRC)" ]]; then \
-	    echo "share/proton-asio/ is empty — run 'make build' first" >&2; \
+	    echo "share/proton-asio/ does not exist — run 'make build' first" >&2; \
 	    exit 1; \
 	fi
+	@count=0; \
+	for d in "$(SHARE_SRC)"/*/; do \
+	    [[ -d "$$d" ]] || continue; \
+	    if [[ -f "$$d/manifest.txt" ]]; then \
+	        count=$$((count + 1)); \
+	    else \
+	        echo "warning: $$d has no manifest.txt — skipping" >&2; \
+	    fi; \
+	done; \
+	if [[ "$$count" -eq 0 ]]; then \
+	    echo "no bridges built (no manifest.txt under $(SHARE_SRC))" >&2; \
+	    echo "run 'make build' to produce them" >&2; \
+	    exit 1; \
+	fi; \
+	echo "installing $$count bridge(s)"
 	$(INSTALL) -Dm755 proton-asio "$(DESTDIR)$(BINDIR)/proton-asio"
 	@cd "$(SHARE_SRC)" && find . -type f -print0 | while IFS= read -r -d '' f; do \
 	    rel=$${f#./}; \

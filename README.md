@@ -126,15 +126,30 @@ proton-asio --uninstall ~/.local/share/Steam/steamapps/compatdata/<appid>
 | | wineasio | pwasio |
 | --- | --- | --- |
 | Backend | JACK API (works over `pipewire-jack`) | native PipeWire |
-| Bitness | 32-bit + 64-bit | 64-bit only (upstream) |
+| Bitness | 64-bit always; 32-bit only if built against legacy non-WoW64 Wine | 64-bit only (upstream) |
 | Maturity | Stable, ~v1.3.0 | Pre-release, 2025–2026 |
-| Min PipeWire | any (or real JACK) | 1.6 |
-| License | GPL-2.0 / LGPL-2.1 | GPL-3.0+ |
+| Min PipeWire | any (or real JACK) | **1.6** (see Sniper note below) |
+| License | GPL-2.0 / LGPL-2.1 | **GPL-3.0-or-later** |
 
-**Default is wineasio** because it covers both bitnesses and just works on
-any modern desktop where `pipewire-jack` is installed (Fedora, Arch,
-Ubuntu 22.04+, openSUSE TW — all default to it). pwasio is the
-lower-latency native path for 64-bit-only titles when you want it.
+**Default is wineasio** because it works on every modern desktop where
+`pipewire-jack` is installed (Fedora, Arch, Ubuntu 22.04+, openSUSE TW —
+all default to it) and is the only option that supports 32-bit games.
+pwasio is the lower-latency native path for 64-bit-only titles, but see
+the [Sniper / PipeWire 1.4 caveat](#pwasio-and-the-steam-linux-runtime)
+before relying on it.
+
+### 32-bit games
+
+32-bit support requires building wineasio against legacy (non-WoW64)
+Wine. Most rolling distros (Arch 11.x, Fedora rolling, openSUSE TW) ship
+WoW64-only Wine and **cannot produce a 32-bit wineasio**. In a release
+tarball built on those hosts, `share/proton-asio/wineasio/manifest.txt`
+omits `dll32=`, and proton-asio warns at install time if the target
+prefix could host 32-bit games. 64-bit games are unaffected.
+
+If you need 32-bit support, build the release on a Debian / Ubuntu LTS
+box (or chroot), where `wine32` is still packaged. See
+[`BUILDING.md`](BUILDING.md#32-bit-support-and-wow64).
 
 ## Troubleshooting
 
@@ -164,6 +179,35 @@ game asks for something different, audio comes through but with quality
 issues. Set PipeWire's default rate to match the game (see
 `pipewire.conf` / `default.clock.rate`) or set `PROTON_ASIO_SR` for pwasio.
 wineasio inherits the JACK rate and cannot override it.
+
+### pwasio and the Steam Linux Runtime
+
+pwasio requires PipeWire ≥ 1.6 for the buffer-negotiation API it uses.
+Steam launches games through the **Sniper runtime container**, which
+ships with **PipeWire 1.4 client libraries** at the time of writing. The
+container's `libpipewire-0.3.so.0` is loaded in preference to the host's,
+so pwasio inside Sniper sees the older API and refuses to connect — even
+if your host system has 1.6+.
+
+Symptoms: pwasio shows up in the game's ASIO picker but selecting it
+fails, or the game crashes / hangs on init. With `PROTON_ASIO_DEBUG=1`
+you'll see pwasio log a PipeWire version mismatch.
+
+Workarounds:
+
+- **Use wineasio instead.** It's the default for a reason — JACK over
+  `pipewire-jack` works fine in the Sniper container.
+- **Disable the Sniper runtime for the affected game.** In Steam,
+  right-click the game → Properties → Compatibility, then pick a Proton
+  version that doesn't force Sniper, OR add `PROTON_NO_RUNTIME=1` to the
+  launch options. This bypasses the container entirely; the host's
+  PipeWire libraries get loaded directly. Some games won't run outside
+  Sniper, so test before relying on this.
+- **Wait for Valve to bump Sniper's PipeWire.** This is moving but
+  there's no committed timeline.
+
+If pwasio works for you outside Sniper but breaks inside, this is the
+cause; switch to wineasio for that game.
 
 **Bridge switch not taking effect.** Switching `PROTON_ASIO_BRIDGE`
 between launches triggers an automatic uninstall sweep of the previous

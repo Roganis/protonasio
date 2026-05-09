@@ -346,7 +346,17 @@ def install_bridge(
             shutil.copyfile(src, dst)
             dbg(f"installed {dst}")
         else:
-            warn(f"{syswow} missing; 32-bit DLL not installed (64-bit-only prefix?)")
+            warn(f"{syswow} missing; 32-bit DLL not installed "
+                 "(64-bit-only prefix?)")
+    elif syswow.is_dir():
+        # 64-bit-only build (WoW64 host Wine, or a bridge that doesn't
+        # ship 32-bit upstream like pwasio) being installed into a
+        # WoW64-capable prefix. The 64-bit DLL still goes in fine; we
+        # only need to be loud about 32-bit games not seeing ASIO.
+        warn(f"{bridge} has no 32-bit DLL in this build; 32-bit Windows "
+             "games in this prefix will NOT see ASIO. 64-bit games are "
+             "unaffected. To get 32-bit support, rebuild with legacy "
+             "(non-WoW64) Wine — see BUILDING.md.")
 
     reg_template = bdir / manifest.get("reg", f"{bridge}.reg.template")
     try:
@@ -637,14 +647,6 @@ def do_install(bridge: str, passthrough: list[str]) -> None:
     if not dll_paths:
         warn(f"no DLLs listed in manifest for {bridge}; launching without ASIO")
         return
-
-    if bridge == "pwasio" and "dll32" not in manifest:
-        # 64-bit-only bridge. We don't know the game's bitness here, but if
-        # the prefix is wow64-enabled (drive_c/windows/syswow64 exists) the
-        # game *might* be 32-bit. We still install — the worst case is that
-        # the game is 32-bit and pwasio.dll is missing from syswow64, which
-        # is exactly what would happen with no tool involved.
-        dbg("pwasio is 64-bit-only; 32-bit games will not see ASIO")
 
     compat = os.environ.get("STEAM_COMPAT_DATA_PATH")
     if not compat:
